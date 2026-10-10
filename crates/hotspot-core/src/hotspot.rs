@@ -1,0 +1,1141 @@
+//! state.json doubles as an undo stack: each resource is recorded before it is created,
+//! and `teardown` undoes whatever is recorded.
+
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::network_backend::NetworkBackend;
+use crate::constants::{
+    bin, AP_ENABLED, AP_IFACE as AP, AP_STA_CONNECTED, AP_STA_DISCONNECTED, AP_STA_PSK_MISMATCH, DHCPACK,
+    DNSMASQ_LEASES, DNSMASQ_STARTUP, DOCKER_USER, FIREWALLD_ZONE as ZONE, HOSTAPD_CONF, HOSTAPD_CTRL,
+    HOSTAPD_TIMEOUT, LOG_LINES, MAX_RESTARTS, NAT_TABLE, RESTART_WINDOW, RUNTIME_DIR, STATE_FILE, TICK,
+};
+use crate::system::SystemBackend;
+use crate::error::{HotspotError, Result};
+use crate::forward::{docker_install, docker_installed, docker_present, docker_remove};
+use crate::models::{
+    normalize_mac, ChannelClass, Client, Command, DnsmasqArgs, Event, Forwarding, HotspotProfile, HotspotState, Probe,
+    Status, UplinkInfo,
+};
+
+type Log = Arc<Mutex<VecDeque<String>>>;
+
+/// Filled by the threads reading hostapd and dnsmasq output.
+#[derive(Default)]
+struct Live {
+    clients: Vec<(String, Instant)>,
+    hostnames: HashMap<String, String>,
+    events: Vec<Event>,
+}
+
+type Shared = Arc<Mutex<Live>>;
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct RunState {
+    uplink_iface: String,
+    ap_iface: String,
+    channel: u32,
+    freq_mhz: u32,
+    hostapd_pid: Option<u32>,
+    dnsmasq_pid: Option<u32>,
+    prev_ip_forward: Option<bool>,
+    created: Created,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Created {
+    ap_iface: bool,
+    addr: bool,
+    firewalld_zone: Option<String>,
+    nft_table: bool,
+    docker_rules: bool,
+}
+
+pub struct Hotspot<B: NetworkBackend> {
+    backend: B,
+    runtime_dir: PathBuf,
+    state: HotspotState,
+    run: Option<RunState>,
+    profile: Option<HotspotProfile>,
+    uplink: Option<UplinkInfo>,
+    forwarding: Forwarding,
+    hostapd: Option<Child>,
+    dnsmasq: Option<Child>,
+    hostapd_log: Log,
+    dnsmasq_log: Log,
+    live: Shared,
+    cut_all: bool,
+    cut_macs: BTreeSet<String>,
+    restarts: Vec<Instant>,
+}
+
+impl<B: NetworkBackend> Hotspot<B> {
+    pub fn new(backend: B, runtime_dir: PathBuf) -> Self {
+        Self {
+            backend,
+            runtime_dir,
+            state: HotspotState::Stopped,
+            run: None,
+            profile: None,
+            uplink: None,
+            forwarding: Forwarding::Ok,
+            hostapd: None,
+            dnsmasq: None,
+            hostapd_log: Log::default(),
+            dnsmasq_log: Log::default(),
+            live: Shared::default(),
+            cut_all: false,
+            cut_macs: BTreeSet::new(),
+            restarts: Vec::new(),
+        }
+    }
+
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    pub fn start(&mut self, p: &HotspotProfile) -> Result<Status> {
+        
+        p.validate()?;
+        if !self.backend.is_root() {
+            return Err(HotspotError::NotRoot);
+        }
+        if self.run.is_some() {
+            return Err(HotspotError::AlreadyRunning);
+        }
+        self.check_previous_run()?;
+        self.backend.ensure_unmanaged_conf()?;
+        fs::create_dir_all(&self.runtime_dir)?;
+        fs::set_permissions(&self.runtime_dir, fs::Permissions::from_mode(0o700))?;
+
+        self.profile = Some(p.clone());
+        match self.start_steps(p) {
+            Ok(()) => {
+                self.state = HotspotState::Running;
+                Ok(self.status())
+            }
+            Err(e) => {
+                self.teardown();
+                self.state = HotspotState::Failed;
+                Err(e)
+            }
+        }
+    }
+
+    fn start_steps(&mut self, p: &HotspotProfile) -> Result<()> {
+        let iface = self.backend.detect_wifi_iface()?;
+        let up = self.backend.uplink_info(&iface)?;
+        let caps = self.backend.adapter_caps(&up.wifi_adapter)?;
+        // by frequency: 6 GHz channel numbers overlap with 2.4 GHz ones
+        let restricted = match caps.channels.iter().find(|c| c.freq_mhz == up.freq_mhz).map(|c| c.class()) {
+            Some(ChannelClass::Disabled) => {
+                return Err(HotspotError::ChannelNotAllowedForAp { channel: up.channel, freq_mhz: up.freq_mhz })
+            }
+            Some(ChannelClass::Restricted) => {
+                eprintln!("warning: channel {} ({} MHz) is restricted (no IR / radar), trying anyway", up.channel, up.freq_mhz);
+                true
+            }
+            _ => false,
+        };
+        if !caps.ap_sta {
+            return Err(HotspotError::ConcurrentApStaUnsupported);
+        }
+        self.run = Some(RunState {
+            uplink_iface: iface.clone(),
+            ap_iface: AP.into(),
+            channel: up.channel,
+            freq_mhz: up.freq_mhz,
+            ..Default::default()
+        });
+        self.uplink = Some(up.clone());
+
+        self.st().created.ap_iface = true;
+        self.save()?;
+        self.backend.create_ap_iface(&iface, AP)?;
+        self.backend.link_up(AP)?; // otherwise hostapd: Beacon set failed: -2
+
+        let conf = self.runtime_dir.join(HOSTAPD_CONF);
+        write_private(&conf, &p.hostapd_conf(AP, up.channel, up.freq_mhz, &self.ctrl_dir()))?;
+
+        self.hostapd_log.lock().unwrap().clear();
+        let mut child = self.backend.spawn_hostapd(&conf)?;
+        self.st().hostapd_pid = Some(child.id());
+        let rx = drain(&mut child, self.hostapd_log.clone(), self.live.clone(), on_hostapd_line);
+        self.hostapd = Some(child);
+        self.save()?;
+        if let Err(timed_out) = wait_for(&rx, AP_ENABLED, HOSTAPD_TIMEOUT) {
+            if timed_out {
+                return Err(HotspotError::HostapdTimeout);
+            }
+            let mut log = tail(&self.hostapd_log);
+            if restricted {
+                log.push_str("\n(restricted channel: the failure may be caused by regulatory rules)");
+            }
+            return Err(HotspotError::HostapdFailed(log));
+        }
+        for mac in &p.blocked {
+            warn(self.backend.block_client(&self.ctrl_dir(), AP, mac, true));
+        }
+
+        self.st().created.addr = true;
+        self.backend.add_addr(AP, &p.gateway_cidr())?;
+        let prev = self.backend.get_ip_forward()?;
+        self.st().prev_ip_forward = Some(prev);
+        self.save()?;
+        self.backend.set_ip_forward(true)?;
+
+        if self.backend.firewalld_running() {
+            self.st().created.firewalld_zone = Some(ZONE.into());
+            self.save()?;
+            self.backend.firewalld_add_iface(ZONE, AP)?;
+        }
+
+        self.st().created.nft_table = true;
+        self.save()?;
+        self.backend.nft_install_nat(&iface)?;
+        self.reapply_cuts()?;
+
+        if docker_present(&self.backend) {
+            self.st().created.docker_rules = true;
+            self.save()?;
+            docker_install(&self.backend, AP, &iface)?;
+        }
+        self.forwarding = if !self.st().created.docker_rules && self.backend.forward_blocked() {
+            Forwarding::Unverified {
+                reason: "a forward chain with policy drop exists and no supported firewall was found: internet access not guaranteed".into(),
+            }
+        } else {
+            Forwarding::Ok
+        };
+
+        self.dnsmasq_log.lock().unwrap().clear();
+        let mut child = self.backend.spawn_dnsmasq(&DnsmasqArgs::new(p, AP, &self.runtime_dir))?;
+        self.st().dnsmasq_pid = Some(child.id());
+        drain(&mut child, self.dnsmasq_log.clone(), self.live.clone(), on_dnsmasq_line);
+        self.dnsmasq = Some(child);
+        self.save()?;
+        thread::sleep(DNSMASQ_STARTUP);
+        if self.dnsmasq.as_mut().unwrap().try_wait()?.is_some() {
+            return Err(HotspotError::DnsmasqFailed(tail(&self.dnsmasq_log)));
+        }
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> Result<()> {
+        self.teardown();
+        self.cut_all = false;
+        self.cut_macs.clear();
+        Ok(())
+    }
+
+    pub fn status(&self) -> Status {
+        let live = self.live.lock().unwrap();
+        let clients = live
+            .clients
+            .iter()
+            .map(|(mac, since)| Client {
+                mac: mac.clone(),
+                hostname: live.hostnames.get(mac).cloned(),
+                connected_secs: since.elapsed().as_secs(),
+                internet_cut: self.cut_macs.contains(mac),
+            })
+            .collect();
+        Status {
+            state: self.state,
+            uplink: self.uplink.clone(),
+            ap_channel: self.run.as_ref().map(|r| r.channel),
+            clients,
+            internet_cut_all: self.cut_all,
+            blocked: self.profile.as_ref().map(|p| p.blocked.clone()).unwrap_or_default(),
+            forwarding: self.forwarding.clone(),
+        }
+    }
+
+    /// Upstream and card capabilities, read-only: works without root and without starting.
+    pub fn probe(&self) -> Result<Probe> {
+        let uplink = self.backend.uplink_info(&self.backend.detect_wifi_iface()?)?;
+        let ap_sta = self.backend.adapter_caps(&uplink.wifi_adapter)?.ap_sta;
+        Ok(Probe { uplink, ap_sta })
+    }
+
+    /// `mac: None` cuts or restores internet for every client. Clients stay connected to the Wi-Fi.
+    pub fn set_internet_cut(&mut self, mac: Option<&str>, cut: bool) -> Result<()> {
+        if self.run.is_none() {
+            return Err(HotspotError::NotRunning);
+        }
+        match mac {
+            None if cut != self.cut_all => {
+                self.backend.nft_cut_iface(AP, cut)?;
+                self.cut_all = cut;
+            }
+            Some(mac) => {
+                let mac = normalize_mac(mac)?;
+                if cut != self.cut_macs.contains(&mac) {
+                    self.backend.nft_cut_mac(&mac, cut)?;
+                    if cut {
+                        self.cut_macs.insert(mac);
+                    } else {
+                        self.cut_macs.remove(&mac);
+                    }
+                }
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// The nft sets live in our table: recreating it (start, reconcile) empties them.
+    fn reapply_cuts(&self) -> Result<()> {
+        if self.cut_all {
+            self.backend.nft_cut_iface(AP, true)?;
+        }
+        for mac in &self.cut_macs {
+            self.backend.nft_cut_mac(mac, true)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the new blocked list. Kept in the profile so a restart re-applies it;
+    /// saving it to the profile file is up to the caller.
+    pub fn set_blocked(&mut self, mac: &str, block: bool) -> Result<Vec<String>> {
+        if self.run.is_none() {
+            return Err(HotspotError::NotRunning);
+        }
+        let mac = normalize_mac(mac)?;
+        let ctrl_dir = self.ctrl_dir();
+        let profile = self.profile.as_mut().expect("profile is known while running");
+        if block != profile.blocked.contains(&mac) {
+            self.backend.block_client(&ctrl_dir, AP, &mac, block)?;
+            if block {
+                profile.blocked.push(mac);
+            } else {
+                profile.blocked.retain(|m| *m != mac);
+            }
+        }
+        Ok(profile.blocked.clone())
+    }
+
+    /// Per-client changes show up in the next `Event::Clients`; the others get their own event.
+    fn apply(&mut self, cmd: Command) -> Result<Option<Event>> {
+        let (mac, cut) = match cmd {
+            Command::Stop => return Ok(None),
+            Command::Block { mac } => return Ok(Some(Event::BlockedChanged { blocked: self.set_blocked(&mac, true)? })),
+            Command::Unblock { mac } => return Ok(Some(Event::BlockedChanged { blocked: self.set_blocked(&mac, false)? })),
+            Command::CutInternet { mac } => (mac, true),
+            Command::RestoreInternet { mac } => (mac, false),
+        };
+        self.set_internet_cut(mac.as_deref(), cut)?;
+        Ok(mac.is_none().then_some(Event::InternetCutAll { cut }))
+    }
+
+    fn ctrl_dir(&self) -> PathBuf {
+        self.runtime_dir.join(HOSTAPD_CTRL)
+    }
+
+    /// Whether a hotspot is running on this machine, started by any process (reads state.json).
+    pub fn is_active(&self) -> bool {
+        let Some(st) = self.load_state() else { return false };
+        [(st.hostapd_pid, bin::HOSTAPD), (st.dnsmasq_pid, bin::DNSMASQ)]
+            .into_iter()
+            .any(|(pid, name)| pid.is_some_and(|pid| self.backend.is_running(pid, name)))
+    }
+
+    pub fn recover(&mut self) -> Result<()> {
+        if self.run.is_none() {
+            let st = match self.load_state() {
+                Some(st) => st,
+                // state.json lost: try everything, each undo step is tolerant
+                None => RunState {
+                    uplink_iface: self.backend.detect_wifi_iface().unwrap_or_default(),
+                    ap_iface: AP.into(),
+                    hostapd_pid: self.backend.pgrep(&self.runtime_dir.join(HOSTAPD_CONF).display().to_string()).first().copied(),
+                    dnsmasq_pid: self.backend.pgrep(&self.runtime_dir.join(DNSMASQ_LEASES).display().to_string()).first().copied(),
+                    created: Created {
+                        ap_iface: true,
+                        addr: true,
+                        firewalld_zone: Some(ZONE.into()),
+                        nft_table: true,
+                        docker_rules: true,
+                    },
+                    ..Default::default()
+                },
+            };
+            self.run = Some(st);
+        }
+        self.teardown();
+        Ok(())
+    }
+
+    fn tick(&mut self) -> Result<Option<Event>> {
+        if self.state != HotspotState::Running {
+            return Ok(None);
+        }
+        let exited = |c: &mut Option<Child>| c.as_mut().is_some_and(|c| !matches!(c.try_wait(), Ok(None)));
+        let dead = if exited(&mut self.hostapd) {
+            Some(HotspotError::HostapdFailed(tail(&self.hostapd_log)))
+        } else if exited(&mut self.dnsmasq) {
+            Some(HotspotError::DnsmasqFailed(tail(&self.dnsmasq_log)))
+        } else {
+            None
+        };
+        if let Some(e) = dead {
+            self.teardown();
+            self.state = HotspotState::Failed;
+            return Err(e);
+        }
+
+        let (iface, freq) = self.run.as_ref().map(|r| (r.uplink_iface.clone(), r.freq_mhz)).unwrap();
+        match self.backend.uplink_info(&iface) {
+            Err(_) => {
+                self.stop()?;
+                return Ok(Some(Event::UplinkLost { iface }));
+            }
+            Ok(up) if up.freq_mhz != freq => {
+                let now = Instant::now();
+                self.restarts.retain(|t| now.duration_since(*t) < RESTART_WINDOW);
+                self.teardown();
+                if self.restarts.len() >= MAX_RESTARTS {
+                    self.state = HotspotState::Failed;
+                    return Err(HotspotError::command(
+                        "automatic restart",
+                        format!("more than {MAX_RESTARTS} restarts in {}s, giving up", RESTART_WINDOW.as_secs()),
+                    ));
+                }
+                self.restarts.push(now);
+                let p = self.profile.clone().expect("profile is known while Running");
+                self.start(&p)?;
+                return Ok(Some(Event::Restarted { channel: up.channel, freq_mhz: up.freq_mhz }));
+            }
+            Ok(up) => self.uplink = Some(up),
+        }
+
+        let b = &self.backend;
+        let st = self.run.as_mut().unwrap();
+        if let Some(zone) = &st.created.firewalld_zone {
+            if b.firewalld_running() && b.firewalld_zone_of(AP).as_deref() != Some(zone.as_str()) {
+                eprintln!("warning: {AP} is no longer in zone {zone} (firewall-cmd --reload?), reinstalling");
+                warn(b.firewalld_add_iface(zone, AP));
+            }
+        }
+        let nat_gone = st.created.nft_table && !b.nft_nat_present();
+        if nat_gone {
+            eprintln!("warning: nft table {NAT_TABLE} is gone, reinstalling");
+            warn(b.nft_install_nat(&st.uplink_iface));
+        }
+        if docker_present(b) && !docker_installed(b, AP, &st.uplink_iface).unwrap_or(true) {
+            eprintln!("warning: {DOCKER_USER} rules are missing, reinstalling");
+            st.created.docker_rules = true;
+            warn(docker_install(b, AP, &st.uplink_iface));
+            self.forwarding = Forwarding::Ok;
+        }
+        if nat_gone {
+            warn(self.reapply_cuts());
+        }
+        self.save()?;
+        Ok(None)
+    }
+
+    /// Runs until `Command::Stop`, the sender being dropped, or the hotspot ending.
+    pub fn supervise(&mut self, commands: &Receiver<Command>, mut on_event: impl FnMut(&Event)) -> Result<()> {
+        let mut last_tick = Instant::now();
+        let mut last_clients = Vec::new();
+        loop {
+            match commands.recv_timeout(TICK.saturating_sub(last_tick.elapsed())) {
+                Ok(Command::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+                Ok(cmd) => match self.apply(cmd) {
+                    Ok(Some(ev)) => on_event(&ev),
+                    Ok(None) => {}
+                    Err(e) => on_event(&Event::Error { message: e.to_string() }),
+                },
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            if last_tick.elapsed() >= TICK {
+                last_tick = Instant::now();
+                if let Some(ev) = self.tick()? {
+                    on_event(&ev);
+                }
+            }
+            let events = std::mem::take(&mut self.live.lock().unwrap().events);
+            events.iter().for_each(&mut on_event);
+
+            let s = self.status();
+            // connected_secs changes every second: compare without it
+            let key: Vec<_> = s.clients.iter().map(|c| (c.mac.clone(), c.hostname.clone(), c.internet_cut)).collect();
+            if key != last_clients {
+                last_clients = key;
+                on_event(&Event::Clients { clients: s.clients });
+            }
+            if s.state != HotspotState::Running {
+                break;
+            }
+        }
+        self.stop()
+    }
+
+    fn teardown(&mut self) {
+        let Some(st) = self.run.take() else { return };
+        let b = &self.backend;
+        for (child, pid, name) in [(self.dnsmasq.take(), st.dnsmasq_pid, bin::DNSMASQ), (self.hostapd.take(), st.hostapd_pid, bin::HOSTAPD)] {
+            if let Some(pid) = pid {
+                b.stop_process(pid, name);
+            }
+            if let Some(mut c) = child {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+        if st.created.docker_rules {
+            docker_remove(b, &st.ap_iface, &st.uplink_iface);
+        }
+        if st.created.nft_table {
+            warn(b.nft_remove_nat());
+        }
+        if let Some(zone) = &st.created.firewalld_zone {
+            if b.firewalld_running() {
+                warn(b.firewalld_remove_iface(zone, &st.ap_iface));
+            }
+        }
+        if let Some(prev) = st.prev_ip_forward {
+            warn(b.set_ip_forward(prev));
+        }
+        if st.created.ap_iface {
+            warn(b.delete_ap_iface(&st.ap_iface)); // also removes the IP address
+        }
+        for f in [HOSTAPD_CONF, DNSMASQ_LEASES, STATE_FILE] {
+            let _ = fs::remove_file(self.runtime_dir.join(f));
+        }
+        let _ = fs::remove_dir_all(self.ctrl_dir()); // socket left behind if hostapd was killed
+        let mut live = self.live.lock().unwrap();
+        live.clients.clear();
+        live.events.clear();
+        drop(live);
+        self.uplink = None;
+        self.forwarding = Forwarding::Ok;
+        self.state = HotspotState::Stopped;
+    }
+
+    /// Refuses if another instance is running; cleans up if the previous one did not stop gracefully.
+    fn check_previous_run(&mut self) -> Result<()> {
+        if self.is_active() {
+            return Err(HotspotError::AlreadyRunning);
+        }
+        if self.state_path().exists() {
+            self.recover()?;
+        }
+        Ok(())
+    }
+
+    fn st(&mut self) -> &mut RunState {
+        self.run.as_mut().expect("run is set before any resource is created")
+    }
+
+    fn state_path(&self) -> PathBuf {
+        self.runtime_dir.join(STATE_FILE)
+    }
+
+    fn load_state(&self) -> Option<RunState> {
+        serde_json::from_str(&fs::read_to_string(self.state_path()).ok()?).ok()
+    }
+
+    fn save(&self) -> Result<()> {
+        let json = serde_json::to_string_pretty(self.run.as_ref().unwrap()).expect("RunState is serializable");
+        Ok(fs::write(self.state_path(), json)?)
+    }
+}
+
+impl Hotspot<SystemBackend> {
+    pub fn system() -> Self {
+        Self::new(SystemBackend, RUNTIME_DIR.into())
+    }
+}
+
+impl<B: NetworkBackend> Drop for Hotspot<B> {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+fn warn(r: Result<()>) {
+    if let Err(e) = r {
+        eprintln!("warning (cleanup): {e}");
+    }
+}
+
+fn write_private(path: &Path, content: &str) -> Result<()> {
+    let _ = fs::remove_file(path); // `mode` only applies on creation
+    let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+    Ok(f.write_all(content.as_bytes())?)
+}
+
+/// Must be read continuously: a full pipe blocks the process.
+fn drain(child: &mut Child, log: Log, live: Shared, parse: fn(&mut Live, &str)) -> Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    let streams: Vec<Box<dyn Read + Send>> = [
+        child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+        child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for stream in streams {
+        let (tx, log, live) = (tx.clone(), log.clone(), live.clone());
+        thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(std::result::Result::ok) {
+                parse(&mut live.lock().unwrap(), &line);
+                let mut l = log.lock().unwrap();
+                if l.len() == LOG_LINES {
+                    l.pop_front();
+                }
+                l.push_back(line.clone());
+                drop(l);
+                let _ = tx.send(line);
+            }
+        });
+    }
+    rx
+}
+
+/// `Err(true)` = timeout, `Err(false)` = process died.
+fn wait_for(rx: &Receiver<String>, needle: &str, timeout: Duration) -> std::result::Result<(), bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(l) if l.contains(needle) => return Ok(()),
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => return Err(true),
+            Err(RecvTimeoutError::Disconnected) => return Err(false),
+        }
+    }
+}
+
+fn tail(log: &Log) -> String {
+    log.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n")
+}
+
+/// `ap0: AP-STA-CONNECTED 34:c9:3d:79:c4:67`
+fn on_hostapd_line(live: &mut Live, line: &str) {
+    let mut words = line.split_whitespace();
+    while let Some(w) = words.next() {
+        let Some(mac) = words.clone().next() else { return };
+        match w {
+            AP_STA_CONNECTED => {
+                if !live.clients.iter().any(|(m, _)| m == mac) {
+                    live.clients.push((mac.into(), Instant::now()));
+                }
+            }
+            AP_STA_DISCONNECTED => live.clients.retain(|(m, _)| m != mac),
+            AP_STA_PSK_MISMATCH => live.events.push(Event::WrongPassword { mac: mac.into() }),
+            _ => continue,
+        }
+        return;
+    }
+}
+
+/// `dnsmasq-dhcp: 292180383 DHCPACK(ap0) 192.168.12.100 34:c9:3d:79:c4:67 pop-os`
+fn on_dnsmasq_line(live: &mut Live, line: &str) {
+    let mut words = line.split_whitespace().skip_while(|w| !w.starts_with(DHCPACK)).skip(2);
+    if let (Some(mac), Some(host)) = (words.next(), words.next()) {
+        live.hostnames.insert(mac.into(), host.into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::process::{Command as Process, Stdio};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+    use crate::models::{ChannelInfo, DnsmasqArgs, PhyCaps, WifiAdapter};
+
+    #[derive(Debug, Default, PartialEq)]
+    struct World {
+        iface: bool,
+        ip_forward: bool,
+        fw: bool,
+        nft: bool,
+        rules: Vec<String>,
+        cut_all: bool,
+        cut_macs: Vec<String>,
+        denied: Vec<String>,
+    }
+
+    struct Mock {
+        calls: RefCell<Vec<String>>,
+        w: RefCell<World>,
+        fail: Option<&'static str>,
+        freq: Cell<u32>, // 0 = uplink not connected
+        docker: Option<bool>, // None = no iptables; Some(false) = no DOCKER-USER chain
+        blocked: bool,
+        running: bool,
+    }
+
+    impl Mock {
+        fn new() -> Self {
+            Self { calls: RefCell::default(), w: RefCell::default(), fail: None, freq: Cell::new(2427), docker: Some(true), blocked: true, running: false }
+        }
+        fn failing(step: &'static str) -> Self {
+            Self { fail: Some(step), ..Self::new() }
+        }
+        fn hit(&self, name: &str) -> Result<()> {
+            self.calls.borrow_mut().push(name.into());
+            if self.fail == Some(name) {
+                return Err(HotspotError::command(name, "injected"));
+            }
+            Ok(())
+        }
+        fn sh(script: &str) -> Result<Child> {
+            Ok(Process::new("sh").args(["-c", script]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?)
+        }
+    }
+
+    impl NetworkBackend for Mock {
+        fn detect_wifi_iface(&self) -> Result<String> {
+            self.hit("detect_wifi_iface").map(|_| "wlo1".into())
+        }
+        fn uplink_info(&self, iface: &str) -> Result<UplinkInfo> {
+            self.hit("uplink_info")?;
+            let f = self.freq.get();
+            if f == 0 {
+                return Err(HotspotError::UplinkNotConnected(iface.into()));
+            }
+            Ok(UplinkInfo {
+                iface: iface.into(),
+                wifi_adapter: WifiAdapter::new("phy0"),
+                channel: if f < 3000 { (f - 2407) / 5 } else { (f - 5000) / 5 },
+                freq_mhz: f,
+                width_mhz: Some(20),
+                ssid: Some("Redmi Note 15 Pro".into()),
+                bssid: None,
+            })
+        }
+        fn adapter_caps(&self, _: &WifiAdapter) -> Result<PhyCaps> {
+            self.hit("adapter_caps")?;
+            let c = |number, freq_mhz, no_ir, disabled| ChannelInfo { number, freq_mhz, no_ir, radar: false, disabled };
+            let channels = vec![c(1, 2412, false, false), c(4, 2427, false, false), c(36, 5180, true, false), c(177, 5885, false, true), c(1, 5955, false, true)];
+            Ok(PhyCaps { channels, ap_sta: true })
+        }
+        fn ensure_unmanaged_conf(&self) -> Result<()> {
+            Ok(())
+        }
+        fn is_root(&self) -> bool {
+            true
+        }
+        fn create_ap_iface(&self, _: &str, _: &str) -> Result<()> {
+            self.hit("create_ap_iface")?;
+            self.w.borrow_mut().iface = true;
+            Ok(())
+        }
+        fn delete_ap_iface(&self, _: &str) -> Result<()> {
+            self.calls.borrow_mut().push("delete_ap_iface".into());
+            self.w.borrow_mut().iface = false;
+            Ok(())
+        }
+        fn link_up(&self, _: &str) -> Result<()> {
+            self.hit("link_up")
+        }
+        fn add_addr(&self, _: &str, _: &str) -> Result<()> {
+            self.hit("add_addr")
+        }
+        fn get_ip_forward(&self) -> Result<bool> {
+            Ok(self.w.borrow().ip_forward)
+        }
+        fn set_ip_forward(&self, on: bool) -> Result<()> {
+            self.hit("set_ip_forward")?;
+            self.w.borrow_mut().ip_forward = on;
+            Ok(())
+        }
+        fn firewalld_running(&self) -> bool {
+            true
+        }
+        fn firewalld_add_iface(&self, _: &str, _: &str) -> Result<()> {
+            self.hit("firewalld_add_iface")?;
+            self.w.borrow_mut().fw = true;
+            Ok(())
+        }
+        fn firewalld_remove_iface(&self, _: &str, _: &str) -> Result<()> {
+            self.calls.borrow_mut().push("firewalld_remove_iface".into());
+            self.w.borrow_mut().fw = false;
+            Ok(())
+        }
+        fn firewalld_zone_of(&self, _: &str) -> Option<String> {
+            self.w.borrow().fw.then(|| "trusted".into())
+        }
+        fn nft_install_nat(&self, _: &str) -> Result<()> {
+            self.hit("nft_install_nat")?;
+            let mut w = self.w.borrow_mut();
+            (w.nft, w.cut_all) = (true, false);
+            w.cut_macs.clear();
+            Ok(())
+        }
+        fn nft_remove_nat(&self) -> Result<()> {
+            self.calls.borrow_mut().push("nft_remove_nat".into());
+            let mut w = self.w.borrow_mut();
+            (w.nft, w.cut_all) = (false, false);
+            w.cut_macs.clear();
+            Ok(())
+        }
+        fn nft_cut_iface(&self, _: &str, cut: bool) -> Result<()> {
+            self.hit("nft_cut_iface")?;
+            self.w.borrow_mut().cut_all = cut;
+            Ok(())
+        }
+        fn nft_cut_mac(&self, mac: &str, cut: bool) -> Result<()> {
+            self.hit("nft_cut_mac")?;
+            let macs = &mut self.w.borrow_mut().cut_macs;
+            macs.retain(|m| m != mac);
+            if cut {
+                macs.push(mac.into());
+            }
+            Ok(())
+        }
+        fn nft_nat_present(&self) -> bool {
+            self.w.borrow().nft
+        }
+        fn forward_blocked(&self) -> bool {
+            self.blocked
+        }
+        fn iptables(&self, args: &[&str]) -> Result<bool> {
+            self.calls.borrow_mut().push(format!("iptables {}", args[0]));
+            let Some(chain) = self.docker else {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+            };
+            let rule = args[1..].join(" ");
+            let mut w = self.w.borrow_mut();
+            Ok(match args[0] {
+                "-S" => chain,
+                "-C" => w.rules.contains(&rule),
+                "-I" if self.fail == Some("iptables -I") => false,
+                "-I" => {
+                    w.rules.push(rule);
+                    true
+                }
+                "-D" => {
+                    w.rules.retain(|r| *r != rule);
+                    true
+                }
+                _ => unreachable!(),
+            })
+        }
+        fn spawn_hostapd(&self, _: &Path) -> Result<Child> {
+            self.hit("spawn_hostapd")?;
+            if self.fail == Some("hostapd dies") {
+                return Mock::sh("echo 'nl80211: Beacon set failed: -2'; exit 1");
+            }
+            Mock::sh("echo 'ap0: AP-ENABLED'; echo 'ap0: AP-STA-CONNECTED 34:c9:3d:79:c4:67'; exec sleep 30")
+        }
+        fn block_client(&self, _: &Path, _: &str, mac: &str, block: bool) -> Result<()> {
+            self.hit("block_client")?;
+            let denied = &mut self.w.borrow_mut().denied;
+            denied.retain(|m| m != mac);
+            if block {
+                denied.push(mac.into());
+            }
+            Ok(())
+        }
+        fn spawn_dnsmasq(&self, _: &DnsmasqArgs) -> Result<Child> {
+            self.hit("spawn_dnsmasq")?;
+            if self.fail == Some("dnsmasq dies") {
+                return Mock::sh("echo 'dnsmasq: failed to create listening socket' >&2; exit 2");
+            }
+            Mock::sh("exec sleep 30")
+        }
+        fn is_running(&self, _: u32, _: &str) -> bool {
+            self.running
+        }
+        fn stop_process(&self, _: u32, name: &str) {
+            self.calls.borrow_mut().push(format!("stop {name}"));
+            if name == bin::HOSTAPD {
+                self.w.borrow_mut().denied.clear(); // the deny list lives in hostapd's memory
+            }
+        }
+        fn pgrep(&self, _: &str) -> Vec<u32> {
+            vec![]
+        }
+    }
+
+    fn hotspot(m: Mock) -> Hotspot<Mock> {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!("hs-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        Hotspot::new(m, dir)
+    }
+
+    fn profile() -> HotspotProfile {
+        HotspotProfile::new("maison", "TestHS", "motdepasse123")
+    }
+
+    fn clean(h: &Hotspot<Mock>) -> bool {
+        *h.backend().w.borrow() == World::default() && fs::read_dir(&h.runtime_dir).map_or(true, |mut d| d.next().is_none())
+    }
+
+    const ORDER: &[&str] = &[
+        "detect_wifi_iface",
+        "uplink_info",
+        "adapter_caps",
+        "create_ap_iface",
+        "link_up",
+        "spawn_hostapd",
+        "add_addr",
+        "set_ip_forward",
+        "firewalld_add_iface",
+        "nft_install_nat",
+        "iptables -S",
+        "iptables -C",
+        "iptables -I",
+        "iptables -C",
+        "iptables -I",
+        "spawn_dnsmasq",
+    ];
+
+    #[test]
+    fn full_start_then_stop_twice() {
+        let mut h = hotspot(Mock::new());
+        let s = h.start(&profile()).unwrap();
+        assert_eq!(s.state, HotspotState::Running);
+        assert_eq!(s.ap_channel, Some(4));
+        assert_eq!(s.forwarding, Forwarding::Ok);
+        assert_eq!(*h.backend().calls.borrow(), ORDER);
+        assert_eq!(h.backend().w.borrow().rules.len(), 2);
+        assert!(h.runtime_dir.join("state.json").exists());
+        assert_eq!(fs::metadata(h.runtime_dir.join("hostapd.conf")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(matches!(h.start(&profile()), Err(HotspotError::AlreadyRunning)));
+
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(h.status().clients[0].mac, "34:c9:3d:79:c4:67");
+
+        h.stop().unwrap();
+        assert!(clean(&h));
+        assert_eq!(h.status().state, HotspotState::Stopped);
+        h.stop().unwrap();
+    }
+
+    #[test]
+    fn failure_at_each_step_rolls_everything_back() {
+        for step in [
+            "detect_wifi_iface",
+            "uplink_info",
+            "adapter_caps",
+            "create_ap_iface",
+            "link_up",
+            "spawn_hostapd",
+            "hostapd dies",
+            "add_addr",
+            "set_ip_forward",
+            "firewalld_add_iface",
+            "nft_install_nat",
+            "iptables -I",
+            "spawn_dnsmasq",
+            "dnsmasq dies",
+        ] {
+            let mut h = hotspot(Mock::failing(step));
+            assert!(h.start(&profile()).is_err(), "{step}");
+            assert!(clean(&h), "{step} : reste {:?}", h.backend().w.borrow());
+            assert_eq!(h.status().state, HotspotState::Failed);
+        }
+    }
+
+    #[test]
+    fn hostapd_failure_carries_log() {
+        let mut h = hotspot(Mock::failing("hostapd dies"));
+        match h.start(&profile()) {
+            Err(HotspotError::HostapdFailed(log)) => assert!(log.contains("Beacon set failed")),
+            r => panic!("{:?}", r.map(|s| s.state)),
+        }
+    }
+
+    #[test]
+    fn disabled_channel_refused_before_any_change() {
+        let m = Mock::new();
+        m.freq.set(5885);
+        let mut h = hotspot(m);
+        assert!(matches!(h.start(&profile()), Err(HotspotError::ChannelNotAllowedForAp { channel: 177, freq_mhz: 5885 })));
+        assert!(!h.backend().calls.borrow().contains(&"create_ap_iface".to_string()));
+    }
+
+    #[test]
+    fn restricted_channel_still_tried() {
+        let m = Mock::new();
+        m.freq.set(5180);
+        let mut h = hotspot(m);
+        assert_eq!(h.start(&profile()).unwrap().ap_channel, Some(36));
+    }
+
+    #[test]
+    fn docker_scenarios() {
+        for docker in [None, Some(false)] {
+            let mut h = hotspot(Mock { docker, ..Mock::new() });
+            assert!(matches!(h.start(&profile()).unwrap().forwarding, Forwarding::Unverified { .. }));
+        }
+        let mut h = hotspot(Mock { docker: None, blocked: false, ..Mock::new() });
+        assert_eq!(h.start(&profile()).unwrap().forwarding, Forwarding::Ok);
+
+        let m = Mock::new();
+        m.w.borrow_mut().rules = vec![
+            "DOCKER-USER -i ap0 -o wlo1 -j ACCEPT".into(),
+            "DOCKER-USER -i wlo1 -o ap0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT".into(),
+        ];
+        let mut h = hotspot(m);
+        h.start(&profile()).unwrap();
+        assert!(!h.backend().calls.borrow().contains(&"iptables -I".to_string()));
+        assert_eq!(h.backend().w.borrow().rules.len(), 2);
+
+        h.backend().w.borrow_mut().rules.clear();
+        h.backend().w.borrow_mut().fw = false;
+        h.backend().w.borrow_mut().nft = false;
+        assert_eq!(h.tick().unwrap(), None);
+        let w = h.backend().w.borrow();
+        assert!(w.fw && w.nft && w.rules.len() == 2);
+    }
+
+    #[test]
+    fn tick_restarts_on_channel_change_and_stops_on_uplink_loss() {
+        let mut h = hotspot(Mock::new());
+        h.start(&profile()).unwrap();
+        h.backend().freq.set(5180);
+        assert!(h.tick().unwrap().unwrap().to_string().contains("channel 36"));
+        assert_eq!(h.status().ap_channel, Some(36));
+        assert_eq!(h.status().state, HotspotState::Running);
+
+        h.backend().freq.set(0);
+        assert!(h.tick().unwrap().unwrap().to_string().contains("lost"));
+        assert!(clean(&h));
+    }
+
+    #[test]
+    fn recover_from_partial_state() {
+        let mut h = hotspot(Mock::new());
+        fs::create_dir_all(&h.runtime_dir).unwrap();
+        fs::write(
+            h.state_path(),
+            r#"{"uplink_iface":"wlo1","ap_iface":"ap0","channel":4,"freq_mhz":2427,
+                "hostapd_pid":4242,"dnsmasq_pid":null,"prev_ip_forward":null,
+                "created":{"ap_iface":true,"addr":false,"firewalld_zone":null,"nft_table":true,"docker_rules":false}}"#,
+        )
+        .unwrap();
+        {
+            let mut w = h.backend().w.borrow_mut();
+            w.iface = true;
+            w.nft = true;
+        }
+        h.recover().unwrap();
+        assert!(clean(&h));
+        assert!(h.backend().calls.borrow().contains(&"stop hostapd".to_string()));
+    }
+
+    #[test]
+    fn previous_run_live_or_stale() {
+        let stale = r#"{"uplink_iface":"wlo1","ap_iface":"ap0","channel":4,"freq_mhz":2427,
+            "hostapd_pid":4242,"dnsmasq_pid":4243,"prev_ip_forward":null,
+            "created":{"ap_iface":true,"addr":false,"firewalld_zone":null,"nft_table":true,"docker_rules":false}}"#;
+
+        let mut h = hotspot(Mock { running: true, ..Mock::new() });
+        assert!(!h.is_active());
+        fs::create_dir_all(&h.runtime_dir).unwrap();
+        fs::write(h.state_path(), stale).unwrap();
+        assert!(h.is_active());
+        assert!(matches!(h.start(&profile()), Err(HotspotError::AlreadyRunning)));
+
+        let mut h = hotspot(Mock::new());
+        fs::create_dir_all(&h.runtime_dir).unwrap();
+        fs::write(h.state_path(), stale).unwrap();
+        assert!(!h.is_active());
+        h.backend().w.borrow_mut().nft = true;
+        assert_eq!(h.start(&profile()).unwrap().state, HotspotState::Running);
+        assert!(h.backend().calls.borrow().contains(&"stop hostapd".to_string()));
+    }
+
+    #[test]
+    fn output_parsing() {
+        let mut live = Live::default();
+        on_hostapd_line(&mut live, "ap0: AP-STA-CONNECTED 34:c9:3d:79:c4:67");
+        on_hostapd_line(&mut live, "ap0: AP-STA-CONNECTED 34:c9:3d:79:c4:67");
+        on_hostapd_line(&mut live, "ap0: AP-STA-CONNECTED aa:bb:cc:dd:ee:ff");
+        on_hostapd_line(&mut live, "ap0: AP-STA-DISCONNECTED 34:c9:3d:79:c4:67");
+        on_hostapd_line(&mut live, "ap0: AP-STA-POSSIBLE-PSK-MISMATCH 12:5a:7a:56:8a:d6");
+        let macs: Vec<&str> = live.clients.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(macs, ["aa:bb:cc:dd:ee:ff"]);
+        assert_eq!(live.events, [Event::WrongPassword { mac: "12:5a:7a:56:8a:d6".into() }]);
+
+        on_dnsmasq_line(&mut live, "dnsmasq-dhcp: 292180383 DHCPREQUEST(ap0) 192.168.12.100 34:c9:3d:79:c4:67");
+        on_dnsmasq_line(&mut live, "dnsmasq-dhcp: 292180383 DHCPACK(ap0) 192.168.12.100 34:c9:3d:79:c4:67 pop-os");
+        on_dnsmasq_line(&mut live, "dnsmasq-dhcp: 292180384 DHCPACK(ap0) 192.168.12.101 aa:bb:cc:dd:ee:ff");
+        assert_eq!(live.hostnames.len(), 1);
+        assert_eq!(live.hostnames["34:c9:3d:79:c4:67"], "pop-os");
+    }
+
+    #[test]
+    fn internet_cut() {
+        let mut h = hotspot(Mock::new());
+        assert!(matches!(h.set_internet_cut(None, true), Err(HotspotError::NotRunning)));
+        h.start(&profile()).unwrap();
+
+        h.set_internet_cut(Some("34:C9:3D:79:C4:67"), true).unwrap();
+        h.set_internet_cut(None, true).unwrap();
+        assert!(matches!(h.set_internet_cut(Some("nope } drop"), true), Err(HotspotError::InvalidMac(_))));
+        thread::sleep(Duration::from_millis(100));
+        let s = h.status();
+        assert!(s.internet_cut_all && s.clients[0].internet_cut);
+        assert_eq!(h.backend().w.borrow().cut_macs, ["34:c9:3d:79:c4:67"]);
+
+        // table recreated behind our back: reconcile puts the cuts back
+        h.backend().w.borrow_mut().nft = false;
+        h.tick().unwrap();
+        let w = h.backend().w.borrow();
+        assert!(w.cut_all && w.cut_macs == ["34:c9:3d:79:c4:67"]);
+        drop(w);
+
+        h.set_internet_cut(None, false).unwrap();
+        assert!(!h.backend().w.borrow().cut_all);
+        h.stop().unwrap();
+        assert!(clean(&h));
+        assert!(!h.status().internet_cut_all);
+    }
+
+    #[test]
+    fn blocking() {
+        let mut p = profile();
+        p.blocked = vec!["aa:bb:cc:dd:ee:ff".into()];
+        let mut h = hotspot(Mock::new());
+        h.start(&p).unwrap();
+        assert_eq!(h.backend().w.borrow().denied, ["aa:bb:cc:dd:ee:ff"]);
+
+        assert_eq!(h.set_blocked("12:5A:7A:56:8A:D6", true).unwrap(), ["aa:bb:cc:dd:ee:ff", "12:5a:7a:56:8a:d6"]);
+        assert_eq!(h.set_blocked("aa:bb:cc:dd:ee:ff", false).unwrap(), ["12:5a:7a:56:8a:d6"]);
+        assert_eq!(h.status().blocked, ["12:5a:7a:56:8a:d6"]);
+
+        // an automatic restart keeps the list
+        h.backend().freq.set(5180);
+        h.tick().unwrap();
+        assert_eq!(h.backend().w.borrow().denied, ["12:5a:7a:56:8a:d6"]);
+    }
+
+    #[test]
+    fn supervise_runs_commands_and_reports_events() {
+        let mut h = hotspot(Mock::new());
+        h.start(&profile()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Command::CutInternet { mac: Some("34:c9:3d:79:c4:67".into()) }).unwrap();
+        tx.send(Command::CutInternet { mac: Some("bad".into()) }).unwrap();
+        tx.send(Command::Block { mac: "aa:bb:cc:dd:ee:ff".into() }).unwrap();
+        tx.send(Command::CutInternet { mac: None }).unwrap();
+        tx.send(Command::Stop).unwrap();
+        let mut events = vec![];
+        h.supervise(&rx, |e| events.push(e.clone())).unwrap();
+
+        assert!(events.iter().any(|e| matches!(e, Event::Error { message } if message.contains("bad"))));
+        assert!(events.iter().any(|e| matches!(e, Event::Clients { clients } if clients[0].internet_cut)));
+        assert!(events.contains(&Event::BlockedChanged { blocked: vec!["aa:bb:cc:dd:ee:ff".into()] }));
+        assert!(events.contains(&Event::InternetCutAll { cut: true }));
+        assert!(clean(&h));
+    }
+}

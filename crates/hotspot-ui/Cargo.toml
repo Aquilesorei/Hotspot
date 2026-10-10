@@ -1,0 +1,13 @@
+# hotspot-ui
+[package]
+name = "hotspot-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hotspot-core.workspace = true
+slint.workspace = true
+anyhow.workspace = true
+ipnet.workspace = true
+[build-dependencies]
+slint-build.workspace = true

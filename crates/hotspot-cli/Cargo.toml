@@ -1,0 +1,12 @@
+# hotspot-cli
+[package]
+name = "hotspot-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hotspot-core.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+ipnet.workspace = true
+serde_json = "1"

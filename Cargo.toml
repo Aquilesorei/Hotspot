@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+hotspot-core = { path = "crates/hotspot-core" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+slint = "1"
+slint-build = "1"
+ipnet = { version = "2", features = ["serde"] }
