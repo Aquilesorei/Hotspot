@@ -1,6 +1,6 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct WifiAdapter(String);
 
@@ -9,7 +9,7 @@ impl WifiAdapter {
     pub fn name(&self) -> &str { &self.0 }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UplinkInfo {
     pub iface: String,
     pub wifi_adapter: WifiAdapter,
@@ -47,7 +47,7 @@ pub struct PhyCaps {
 }
 
 /// Read-only look at the upstream and the card, usable without root (before starting).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Probe {
     pub uplink: UplinkInfo,
     pub ap_sta: bool,

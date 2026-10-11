@@ -1,3 +1,5 @@
+mod daemon;
+
 use std::io::BufRead;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -6,7 +8,7 @@ use std::sync::mpsc;
 
 use clap::{Parser, Subcommand};
 use anyhow::{bail, Context};
-use hotspot_core::{invoking_user, Command, Event, Hotspot, HotspotProfile, ProfileStore};
+use hotspot_core::{invoking_user, BlockedDevice, Command, Event, Hotspot, HotspotProfile, ProfileStore};
 use serde_json::json;
 
 #[derive(Parser)]
@@ -30,6 +32,9 @@ enum Cmd {
         json: bool,
     },
 
+    /// Run the engine as a background service on a Unix socket (root, for systemd)
+    Daemon,
+
     /// Upstream Wi-Fi and card support, without root
     Probe {
         #[arg(long)]
@@ -52,9 +57,9 @@ enum Cmd {
     #[command(hide = true)]
     ProfileJson { key: String },
 
-    /// Internal: saves a profile's blocked list (run as the calling user)
+    /// Internal: saves a profile's blocked list, given as JSON (run as the calling user)
     #[command(hide = true)]
-    SetBlocked { name: String, macs: Vec<String> },
+    SetBlocked { name: String, blocked: String },
 }
 
 const RUNUSER: &str = "runuser";
@@ -96,10 +101,12 @@ fn main() -> anyhow::Result<()> {
             (Err(e), false) => return Err(e.into()),
         },
         Cmd::Start { profile, json } => start(&profile, path, json)?,
+        Cmd::Daemon => daemon::run()?,
         Cmd::ProfileJson { key } => println!("{}", serde_json::to_string(&ProfileStore::get(&key, path)?)?),
-        Cmd::SetBlocked { name, macs } => {
+        Cmd::SetBlocked { name, blocked } => {
             let p = ProfileStore::get(&name, path)?;
-            ProfileStore::upsert(Some(&p.name), HotspotProfile { blocked: macs, ..p.clone() }, path)?;
+            let blocked = serde_json::from_str(&blocked)?;
+            ProfileStore::upsert(Some(&p.name), HotspotProfile { blocked, ..p.clone() }, path)?;
         }
     }
     Ok(())
@@ -114,6 +121,9 @@ fn start(profile: &str, path: Option<&Path>, json: bool) -> anyhow::Result<()> {
         }
     };
     let p = load_profile(profile, path)?;
+    if json {
+        println!("{}", json!({ "event": "starting" })); // authorization passed, the UI can say so
+    }
     let mut hotspot = Hotspot::system();
     match hotspot.start(&p) {
         Ok(status) => print(status.to_string(), json!({ "event": "started", "status": status })),
@@ -123,7 +133,10 @@ fn start(profile: &str, path: Option<&Path>, json: bool) -> anyhow::Result<()> {
         }
     }
     if !json {
-        println!("Commands: cut [mac], restore [mac], block <mac>, unblock <mac>. Enter or `stop` to quit.");
+        println!(
+            "Commands: cut [mac], restore [mac], block <mac>, unblock <mac>, allow <mac> <minutes|off>, \
+             limit <mac> <mbps|off>. Enter or `stop` to quit."
+        );
     }
 
     let (tx, rx) = mpsc::channel();
@@ -145,6 +158,9 @@ fn start(profile: &str, path: Option<&Path>, json: bool) -> anyhow::Result<()> {
     });
 
     hotspot.supervise(&rx, |event| {
+        if !json && matches!(event, Event::Usage { .. }) {
+            return; // byte counters every few seconds would drown the terminal
+        }
         print(event.to_string(), serde_json::to_value(event).expect("Event is serializable"));
         if let Event::BlockedChanged { blocked } = event {
             if let Err(e) = save_blocked(&p, blocked, path) {
@@ -185,14 +201,15 @@ fn load_profile(key: &str, path: Option<&Path>) -> anyhow::Result<HotspotProfile
     Ok(p)
 }
 
-fn save_blocked(p: &HotspotProfile, blocked: &[String], path: Option<&Path>) -> anyhow::Result<()> {
+fn save_blocked(p: &HotspotProfile, blocked: &[BlockedDevice], path: Option<&Path>) -> anyhow::Result<()> {
     let Some(user) = caller() else {
-        ProfileStore::upsert(Some(&p.name), HotspotProfile { blocked: blocked.to_vec(), ..p.clone() }, path)?;
+        // re-read: the profile may have changed (aliases, settings) since the hotspot started
+        let current = ProfileStore::get(&p.name, path)?;
+        ProfileStore::upsert(Some(&p.name), HotspotProfile { blocked: blocked.to_vec(), ..current }, path)?;
         return Ok(());
     };
-    let mut args = vec!["set-blocked", p.name.as_str()];
-    args.extend(blocked.iter().map(String::as_str));
-    let out = as_user(&user, path, &args).output().context(RUNUSER)?;
+    let json = serde_json::to_string(blocked)?;
+    let out = as_user(&user, path, &["set-blocked", &p.name, &json]).output().context(RUNUSER)?;
     if !out.status.success() {
         bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -201,8 +218,16 @@ fn save_blocked(p: &HotspotProfile, blocked: &[String], path: Option<&Path>) -> 
 
 fn parse_text(line: &str) -> Result<Command, String> {
     let mut words = line.split_whitespace();
-    let (cmd, mac) = (words.next(), words.next().map(String::from));
+    let (cmd, mac, value) = (words.next(), words.next().map(String::from), words.next());
+    // "off" removes the limit; anything else must be a number
+    let number = || match value {
+        Some("off") => Ok(None),
+        Some(v) => v.parse().map(Some).map_err(|_| format!("not a number: {v}")),
+        None => Err(format!("missing value: {line}")),
+    };
     Ok(match (cmd, mac) {
+        (Some("allow"), Some(mac)) => Command::AllowFor { mac, minutes: number()? },
+        (Some("limit"), Some(mac)) => Command::LimitSpeed { mac, mbps: number()? },
         (None | Some("stop"), _) => Command::Stop,
         (Some("cut"), mac) => Command::CutInternet { mac },
         (Some("restore"), mac) => Command::RestoreInternet { mac },
@@ -226,6 +251,10 @@ mod tests {
         assert_eq!(parse_text("restore aa:bb:cc:dd:ee:ff"), Ok(Command::RestoreInternet { mac: mac() }));
         assert_eq!(parse_text("block aa:bb:cc:dd:ee:ff"), Ok(Command::Block { mac: mac().unwrap() }));
         assert!(parse_text("block").is_err());
+        assert_eq!(parse_text("allow aa:bb:cc:dd:ee:ff 30"), Ok(Command::AllowFor { mac: mac().unwrap(), minutes: Some(30) }));
+        assert_eq!(parse_text("limit aa:bb:cc:dd:ee:ff off"), Ok(Command::LimitSpeed { mac: mac().unwrap(), mbps: None }));
+        assert!(parse_text("limit aa:bb:cc:dd:ee:ff fast").is_err());
+        assert!(parse_text("allow aa:bb:cc:dd:ee:ff").is_err());
         assert!(parse_text("reboot").is_err());
     }
 }

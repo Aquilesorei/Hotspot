@@ -10,3 +10,4 @@ clap.workspace = true
 anyhow.workspace = true
 ipnet.workspace = true
 serde_json = "1"
+serde.workspace = true

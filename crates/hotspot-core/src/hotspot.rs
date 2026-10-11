@@ -1,7 +1,7 @@
 //! state.json doubles as an undo stack: each resource is recorded before it is created,
 //! and `teardown` undoes whatever is recorded.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -17,15 +17,15 @@ use serde::{Deserialize, Serialize};
 use crate::network_backend::NetworkBackend;
 use crate::constants::{
     bin, AP_ENABLED, AP_IFACE as AP, AP_STA_CONNECTED, AP_STA_DISCONNECTED, AP_STA_PSK_MISMATCH, DHCPACK,
-    DNSMASQ_LEASES, DNSMASQ_STARTUP, DOCKER_USER, FIREWALLD_ZONE as ZONE, HOSTAPD_CONF, HOSTAPD_CTRL,
-    HOSTAPD_TIMEOUT, LOG_LINES, MAX_RESTARTS, NAT_TABLE, RESTART_WINDOW, RUNTIME_DIR, STATE_FILE, TICK,
+    DNSMASQ_LEASES, DNSMASQ_STARTUP, DOCKER_USER, FIREWALLD_ZONE as ZONE, GUEST_MINUTES, HOSTAPD_CONF, HOSTAPD_CTRL, SPEED_LIMIT_MBPS,
+    HOSTAPD_TIMEOUT, LOG_LINES, MAX_RESTARTS, USAGE_REPORT_EVERY, NAT_TABLE, RESTART_WINDOW, RUNTIME_DIR, STATE_FILE, TICK,
 };
 use crate::system::SystemBackend;
 use crate::error::{HotspotError, Result};
 use crate::forward::{docker_install, docker_installed, docker_present, docker_remove};
 use crate::models::{
-    normalize_mac, ChannelClass, Client, Command, DnsmasqArgs, Event, Forwarding, HotspotProfile, HotspotState, Probe,
-    Status, UplinkInfo,
+    normalize_mac, BlockedDevice, ChannelClass, Client, Command, DeviceUsage, DnsmasqArgs, Event, Forwarding, HotspotProfile,
+    HotspotState, Probe, Status, UplinkInfo,
 };
 
 type Log = Arc<Mutex<VecDeque<String>>>;
@@ -34,7 +34,8 @@ type Log = Arc<Mutex<VecDeque<String>>>;
 #[derive(Default)]
 struct Live {
     clients: Vec<(String, Instant)>,
-    hostnames: HashMap<String, String>,
+    /// From dnsmasq's DHCPACK lines, by MAC: (ip, hostname).
+    leases: HashMap<String, (String, Option<String>)>,
     events: Vec<Event>,
 }
 
@@ -76,6 +77,16 @@ pub struct Hotspot<B: NetworkBackend> {
     live: Shared,
     cut_all: bool,
     cut_macs: BTreeSet<String>,
+    /// Temporary access deadlines by MAC; the device gets blocked when one passes.
+    deadlines: HashMap<String, Instant>,
+    /// Speed limits by MAC, applied by IP once the device has a lease.
+    speed: BTreeMap<String, u32>,
+    applied_speed: Vec<(String, u32)>,
+    /// Bytes by client IP: (down, up).
+    usage: HashMap<String, (u64, u64)>,
+    /// Last client list reported, to send `Event::Clients` only on change.
+    reported_clients: Vec<Client>,
+    reported_usage: (Instant, HashMap<String, (u64, u64)>),
     restarts: Vec<Instant>,
 }
 
@@ -96,6 +107,12 @@ impl<B: NetworkBackend> Hotspot<B> {
             live: Shared::default(),
             cut_all: false,
             cut_macs: BTreeSet::new(),
+            deadlines: HashMap::new(),
+            speed: BTreeMap::new(),
+            applied_speed: Vec::new(),
+            usage: HashMap::new(),
+            reported_clients: Vec::new(),
+            reported_usage: (Instant::now(), HashMap::new()),
             restarts: Vec::new(),
         }
     }
@@ -183,8 +200,8 @@ impl<B: NetworkBackend> Hotspot<B> {
             }
             return Err(HotspotError::HostapdFailed(log));
         }
-        for mac in &p.blocked {
-            warn(self.backend.block_client(&self.ctrl_dir(), AP, mac, true));
+        for b in &p.blocked {
+            warn(self.backend.block_client(&self.ctrl_dir(), AP, &b.mac, true));
         }
 
         self.st().created.addr = true;
@@ -235,6 +252,11 @@ impl<B: NetworkBackend> Hotspot<B> {
         self.teardown();
         self.cut_all = false;
         self.cut_macs.clear();
+        self.deadlines.clear();
+        self.speed.clear();
+        self.usage.clear();
+        self.reported_clients.clear();
+        self.live.lock().unwrap().leases.clear();
         Ok(())
     }
 
@@ -243,11 +265,20 @@ impl<B: NetworkBackend> Hotspot<B> {
         let clients = live
             .clients
             .iter()
-            .map(|(mac, since)| Client {
-                mac: mac.clone(),
-                hostname: live.hostnames.get(mac).cloned(),
-                connected_secs: since.elapsed().as_secs(),
-                internet_cut: self.cut_macs.contains(mac),
+            .map(|(mac, since)| {
+                let ip = live.leases.get(mac).map(|(ip, _)| ip.clone());
+                let (down_bytes, up_bytes) = ip.as_ref().and_then(|ip| self.usage.get(ip)).copied().unwrap_or_default();
+                Client {
+                    mac: mac.clone(),
+                    hostname: live.leases.get(mac).and_then(|(_, host)| host.clone()),
+                    ip,
+                    connected_secs: since.elapsed().as_secs(),
+                    internet_cut: self.cut_macs.contains(mac),
+                    down_bytes,
+                    up_bytes,
+                    expires_in_secs: self.deadlines.get(mac).map(|d| d.saturating_duration_since(Instant::now()).as_secs()),
+                    speed_limit_mbps: self.speed.get(mac).copied(),
+                }
             })
             .collect();
         Status {
@@ -307,28 +338,85 @@ impl<B: NetworkBackend> Hotspot<B> {
 
     /// Returns the new blocked list. Kept in the profile so a restart re-applies it;
     /// saving it to the profile file is up to the caller.
-    pub fn set_blocked(&mut self, mac: &str, block: bool) -> Result<Vec<String>> {
+    pub fn set_blocked(&mut self, mac: &str, block: bool) -> Result<Vec<BlockedDevice>> {
         if self.run.is_none() {
             return Err(HotspotError::NotRunning);
         }
         let mac = normalize_mac(mac)?;
         let ctrl_dir = self.ctrl_dir();
+        let name = self.live.lock().unwrap().leases.get(&mac).and_then(|(_, host)| host.clone());
         let profile = self.profile.as_mut().expect("profile is known while running");
-        if block != profile.blocked.contains(&mac) {
+        if block != profile.blocked.iter().any(|b| b.mac == mac) {
             self.backend.block_client(&ctrl_dir, AP, &mac, block)?;
             if block {
-                profile.blocked.push(mac);
+                profile.blocked.push(BlockedDevice { mac, name });
             } else {
-                profile.blocked.retain(|m| *m != mac);
+                profile.blocked.retain(|b| b.mac != mac);
             }
         }
         Ok(profile.blocked.clone())
     }
 
-    /// Per-client changes show up in the next `Event::Clients`; the others get their own event.
-    fn apply(&mut self, cmd: Command) -> Result<Option<Event>> {
+    /// The device gets blocked after `minutes`; `None` removes the limit. Not saved: it ends with the session.
+    pub fn set_time_limit(&mut self, mac: &str, minutes: Option<u32>) -> Result<()> {
+        if self.run.is_none() {
+            return Err(HotspotError::NotRunning);
+        }
+        let mac = normalize_mac(mac)?;
+        match minutes {
+            Some(m) if !GUEST_MINUTES.contains(&m) => {
+                return Err(HotspotError::invalid_profile(format!(
+                    "time limit must be {} to {} minutes",
+                    GUEST_MINUTES.start(),
+                    GUEST_MINUTES.end()
+                )))
+            }
+            Some(m) => self.deadlines.insert(mac, Instant::now() + Duration::from_secs(u64::from(m) * 60)),
+            None => self.deadlines.remove(&mac),
+        };
+        Ok(())
+    }
+
+    /// Download and upload limit for one device; `None` removes it.
+    pub fn set_speed_limit(&mut self, mac: &str, mbps: Option<u32>) -> Result<()> {
+        if self.run.is_none() {
+            return Err(HotspotError::NotRunning);
+        }
+        let mac = normalize_mac(mac)?;
+        match mbps {
+            Some(m) if !SPEED_LIMIT_MBPS.contains(&m) => {
+                return Err(HotspotError::invalid_profile(format!(
+                    "speed limit must be {} to {} Mbit/s",
+                    SPEED_LIMIT_MBPS.start(),
+                    SPEED_LIMIT_MBPS.end()
+                )))
+            }
+            Some(m) => self.speed.insert(mac, m),
+            None => self.speed.remove(&mac),
+        };
+        self.apply_speed()
+    }
+
+    /// Limits are set per IP, which a device only has once DHCP answered: re-run on every tick.
+    fn apply_speed(&mut self) -> Result<()> {
+        let wanted: Vec<(String, u32)> = {
+            let live = self.live.lock().unwrap();
+            self.speed.iter().filter_map(|(mac, mbps)| live.leases.get(mac).map(|(ip, _)| (ip.clone(), *mbps))).collect()
+        };
+        if wanted != self.applied_speed {
+            self.backend.tc_limits(AP, &wanted)?;
+            self.applied_speed = wanted;
+        }
+        Ok(())
+    }
+
+    /// One command from a caller (CLI, service). Per-client changes show up in the next
+    /// `Event::Clients`; the others get their own event.
+    pub fn handle(&mut self, cmd: Command) -> Result<Option<Event>> {
         let (mac, cut) = match cmd {
             Command::Stop => return Ok(None),
+            Command::AllowFor { mac, minutes } => return self.set_time_limit(&mac, minutes).map(|_| None),
+            Command::LimitSpeed { mac, mbps } => return self.set_speed_limit(&mac, mbps).map(|_| None),
             Command::Block { mac } => return Ok(Some(Event::BlockedChanged { blocked: self.set_blocked(&mac, true)? })),
             Command::Unblock { mac } => return Ok(Some(Event::BlockedChanged { blocked: self.set_blocked(&mac, false)? })),
             Command::CutInternet { mac } => (mac, true),
@@ -441,18 +529,87 @@ impl<B: NetworkBackend> Hotspot<B> {
         if nat_gone {
             warn(self.reapply_cuts());
         }
+        match self.backend.nft_usage() {
+            Ok(usage) => {
+                self.usage = usage;
+                self.report_usage();
+            }
+            Err(e) => eprintln!("warning: could not read data usage: {e}"),
+        }
+        warn(self.apply_speed());
+        let expired: Vec<String> =
+            self.deadlines.iter().filter(|(_, d)| **d <= Instant::now()).map(|(mac, _)| mac.clone()).collect();
+        for mac in expired {
+            self.deadlines.remove(&mac);
+            match self.set_blocked(&mac, true) {
+                Ok(blocked) => {
+                    let mut live = self.live.lock().unwrap();
+                    live.events.push(Event::AccessExpired { mac });
+                    live.events.push(Event::BlockedChanged { blocked });
+                }
+                Err(e) => eprintln!("warning: could not block {mac} after its time limit: {e}"),
+            }
+        }
         self.save()?;
         Ok(None)
+    }
+
+    /// Periodic work, about every `TICK` while running: the watcher, then what happened since.
+    pub fn poll(&mut self) -> Result<Vec<Event>> {
+        let mut events: Vec<Event> = self.tick()?.into_iter().collect();
+        events.extend(self.take_events());
+        Ok(events)
+    }
+
+    fn report_usage(&mut self) {
+        let (at, last) = &self.reported_usage;
+        if at.elapsed() < USAGE_REPORT_EVERY || *last == self.usage {
+            return;
+        }
+        let live = self.live.lock().unwrap();
+        let usage = live
+            .clients
+            .iter()
+            .filter_map(|(mac, _)| {
+                let (ip, _) = live.leases.get(mac)?;
+                let (down_bytes, up_bytes) = *self.usage.get(ip)?;
+                Some(DeviceUsage { mac: mac.clone(), down_bytes, up_bytes })
+            })
+            .collect();
+        drop(live);
+        self.reported_usage = (Instant::now(), self.usage.clone());
+        self.live.lock().unwrap().events.push(Event::Usage { usage });
+    }
+
+    /// Events from hostapd/dnsmasq output, plus `Event::Clients` when the list changed.
+    pub fn take_events(&mut self) -> Vec<Event> {
+        let mut events = std::mem::take(&mut self.live.lock().unwrap().events);
+        // connected time and countdowns change every second: compare without them
+        let clients = self.status().clients;
+        let comparable: Vec<Client> = clients
+            .iter()
+            .map(|c| Client {
+                connected_secs: 0,
+                expires_in_secs: c.expires_in_secs.map(|_| 0),
+                down_bytes: 0,
+                up_bytes: 0,
+                ..c.clone()
+            })
+            .collect();
+        if comparable != self.reported_clients {
+            self.reported_clients = comparable;
+            events.push(Event::Clients { clients });
+        }
+        events
     }
 
     /// Runs until `Command::Stop`, the sender being dropped, or the hotspot ending.
     pub fn supervise(&mut self, commands: &Receiver<Command>, mut on_event: impl FnMut(&Event)) -> Result<()> {
         let mut last_tick = Instant::now();
-        let mut last_clients = Vec::new();
         loop {
             match commands.recv_timeout(TICK.saturating_sub(last_tick.elapsed())) {
                 Ok(Command::Stop) | Err(RecvTimeoutError::Disconnected) => break,
-                Ok(cmd) => match self.apply(cmd) {
+                Ok(cmd) => match self.handle(cmd) {
                     Ok(Some(ev)) => on_event(&ev),
                     Ok(None) => {}
                     Err(e) => on_event(&Event::Error { message: e.to_string() }),
@@ -465,17 +622,8 @@ impl<B: NetworkBackend> Hotspot<B> {
                     on_event(&ev);
                 }
             }
-            let events = std::mem::take(&mut self.live.lock().unwrap().events);
-            events.iter().for_each(&mut on_event);
-
-            let s = self.status();
-            // connected_secs changes every second: compare without it
-            let key: Vec<_> = s.clients.iter().map(|c| (c.mac.clone(), c.hostname.clone(), c.internet_cut)).collect();
-            if key != last_clients {
-                last_clients = key;
-                on_event(&Event::Clients { clients: s.clients });
-            }
-            if s.state != HotspotState::Running {
+            self.take_events().iter().for_each(&mut on_event);
+            if self.state != HotspotState::Running {
                 break;
             }
         }
@@ -515,6 +663,7 @@ impl<B: NetworkBackend> Hotspot<B> {
             let _ = fs::remove_file(self.runtime_dir.join(f));
         }
         let _ = fs::remove_dir_all(self.ctrl_dir()); // socket left behind if hostapd was killed
+        self.applied_speed.clear(); // tc qdiscs went away with the interface
         let mut live = self.live.lock().unwrap();
         live.clients.clear();
         live.events.clear();
@@ -643,9 +792,9 @@ fn on_hostapd_line(live: &mut Live, line: &str) {
 
 /// `dnsmasq-dhcp: 292180383 DHCPACK(ap0) 192.168.12.100 34:c9:3d:79:c4:67 pop-os`
 fn on_dnsmasq_line(live: &mut Live, line: &str) {
-    let mut words = line.split_whitespace().skip_while(|w| !w.starts_with(DHCPACK)).skip(2);
-    if let (Some(mac), Some(host)) = (words.next(), words.next()) {
-        live.hostnames.insert(mac.into(), host.into());
+    let mut words = line.split_whitespace().skip_while(|w| !w.starts_with(DHCPACK)).skip(1);
+    if let (Some(ip), Some(mac)) = (words.next(), words.next()) {
+        live.leases.insert(mac.into(), (ip.into(), words.next().map(String::from)));
     }
 }
 
@@ -668,6 +817,8 @@ mod tests {
         cut_all: bool,
         cut_macs: Vec<String>,
         denied: Vec<String>,
+        usage: HashMap<String, (u64, u64)>,
+        tc: Vec<(String, u32)>,
     }
 
     struct Mock {
@@ -738,7 +889,10 @@ mod tests {
         }
         fn delete_ap_iface(&self, _: &str) -> Result<()> {
             self.calls.borrow_mut().push("delete_ap_iface".into());
-            self.w.borrow_mut().iface = false;
+            let mut w = self.w.borrow_mut();
+            w.iface = false;
+            w.tc.clear(); // qdiscs go away with the interface
+            w.usage.clear();
             Ok(())
         }
         fn link_up(&self, _: &str) -> Result<()> {
@@ -801,6 +955,14 @@ mod tests {
         }
         fn nft_nat_present(&self) -> bool {
             self.w.borrow().nft
+        }
+        fn nft_usage(&self) -> Result<HashMap<String, (u64, u64)>> {
+            Ok(self.w.borrow().usage.clone())
+        }
+        fn tc_limits(&self, _: &str, limits: &[(String, u32)]) -> Result<()> {
+            self.hit("tc_limits")?;
+            self.w.borrow_mut().tc = limits.to_vec();
+            Ok(())
         }
         fn forward_blocked(&self) -> bool {
             self.blocked
@@ -1069,8 +1231,9 @@ mod tests {
         on_dnsmasq_line(&mut live, "dnsmasq-dhcp: 292180383 DHCPREQUEST(ap0) 192.168.12.100 34:c9:3d:79:c4:67");
         on_dnsmasq_line(&mut live, "dnsmasq-dhcp: 292180383 DHCPACK(ap0) 192.168.12.100 34:c9:3d:79:c4:67 pop-os");
         on_dnsmasq_line(&mut live, "dnsmasq-dhcp: 292180384 DHCPACK(ap0) 192.168.12.101 aa:bb:cc:dd:ee:ff");
-        assert_eq!(live.hostnames.len(), 1);
-        assert_eq!(live.hostnames["34:c9:3d:79:c4:67"], "pop-os");
+        assert_eq!(live.leases["34:c9:3d:79:c4:67"], ("192.168.12.100".into(), Some("pop-os".into())));
+        assert_eq!(live.leases["aa:bb:cc:dd:ee:ff"], ("192.168.12.101".into(), None));
+        assert_eq!(live.leases.len(), 2);
     }
 
     #[test]
@@ -1104,19 +1267,70 @@ mod tests {
     #[test]
     fn blocking() {
         let mut p = profile();
-        p.blocked = vec!["aa:bb:cc:dd:ee:ff".into()];
+        p.blocked = vec![BlockedDevice { mac: "aa:bb:cc:dd:ee:ff".into(), name: None }];
+        let macs = |list: Vec<BlockedDevice>| list.into_iter().map(|b| b.mac).collect::<Vec<_>>();
         let mut h = hotspot(Mock::new());
         h.start(&p).unwrap();
         assert_eq!(h.backend().w.borrow().denied, ["aa:bb:cc:dd:ee:ff"]);
 
-        assert_eq!(h.set_blocked("12:5A:7A:56:8A:D6", true).unwrap(), ["aa:bb:cc:dd:ee:ff", "12:5a:7a:56:8a:d6"]);
-        assert_eq!(h.set_blocked("aa:bb:cc:dd:ee:ff", false).unwrap(), ["12:5a:7a:56:8a:d6"]);
-        assert_eq!(h.status().blocked, ["12:5a:7a:56:8a:d6"]);
+        h.live.lock().unwrap().leases.insert("12:5a:7a:56:8a:d6".into(), ("192.168.12.100".into(), Some("REDMI".into())));
+        assert_eq!(macs(h.set_blocked("12:5A:7A:56:8A:D6", true).unwrap()), ["aa:bb:cc:dd:ee:ff", "12:5a:7a:56:8a:d6"]);
+        assert_eq!(macs(h.set_blocked("aa:bb:cc:dd:ee:ff", false).unwrap()), ["12:5a:7a:56:8a:d6"]);
+        assert_eq!(h.status().blocked, [BlockedDevice { mac: "12:5a:7a:56:8a:d6".into(), name: Some("REDMI".into()) }]);
 
         // an automatic restart keeps the list
         h.backend().freq.set(5180);
         h.tick().unwrap();
         assert_eq!(h.backend().w.borrow().denied, ["12:5a:7a:56:8a:d6"]);
+    }
+
+    #[test]
+    fn usage_time_and_speed_limits() {
+        let mut h = hotspot(Mock::new());
+        h.start(&profile()).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let mac = "34:c9:3d:79:c4:67";
+        h.live.lock().unwrap().leases.insert(mac.into(), ("192.168.12.100".into(), None));
+        h.backend().w.borrow_mut().usage.insert("192.168.12.100".into(), (3400, 60));
+
+        h.set_speed_limit(mac, Some(5)).unwrap();
+        assert_eq!(h.backend().w.borrow().tc, [("192.168.12.100".to_string(), 5)]);
+        assert!(h.set_speed_limit(mac, Some(0)).is_err());
+        h.set_time_limit(mac, Some(30)).unwrap();
+        assert!(h.set_time_limit(mac, Some(0)).is_err());
+
+        h.tick().unwrap();
+        let c = &h.status().clients[0];
+        assert_eq!((c.down_bytes, c.up_bytes, c.speed_limit_mbps), (3400, 60, Some(5)));
+        assert!(c.expires_in_secs.unwrap() > 29 * 60);
+
+        // deadline passes: the device gets blocked and both events are queued
+        h.deadlines.insert(mac.into(), Instant::now());
+        h.tick().unwrap();
+        assert_eq!(h.backend().w.borrow().denied, [mac]);
+        let events = std::mem::take(&mut h.live.lock().unwrap().events);
+        assert_eq!(events[0], Event::AccessExpired { mac: mac.into() });
+        assert!(matches!(&events[1], Event::BlockedChanged { blocked } if blocked[0].mac == mac));
+
+        h.set_speed_limit(mac, None).unwrap();
+        assert!(h.backend().w.borrow().tc.is_empty());
+        h.stop().unwrap();
+        assert!(clean(&h));
+    }
+
+    #[test]
+    fn speed_limit_survives_automatic_restart() {
+        let mut h = hotspot(Mock::new());
+        h.start(&profile()).unwrap();
+        let mac = "34:c9:3d:79:c4:67";
+        h.live.lock().unwrap().leases.insert(mac.into(), ("192.168.12.100".into(), None));
+        h.set_speed_limit(mac, Some(5)).unwrap();
+
+        h.backend().freq.set(5180); // upstream changes channel: ap0 and its qdiscs are recreated
+        h.tick().unwrap();
+        assert!(h.backend().w.borrow().tc.is_empty());
+        h.tick().unwrap();
+        assert_eq!(h.backend().w.borrow().tc, [("192.168.12.100".to_string(), 5)]);
     }
 
     #[test]
@@ -1134,7 +1348,7 @@ mod tests {
 
         assert!(events.iter().any(|e| matches!(e, Event::Error { message } if message.contains("bad"))));
         assert!(events.iter().any(|e| matches!(e, Event::Clients { clients } if clients[0].internet_cut)));
-        assert!(events.contains(&Event::BlockedChanged { blocked: vec!["aa:bb:cc:dd:ee:ff".into()] }));
+        assert!(events.contains(&Event::BlockedChanged { blocked: vec![BlockedDevice { mac: "aa:bb:cc:dd:ee:ff".into(), name: None }] }));
         assert!(events.contains(&Event::InternetCutAll { cut: true }));
         assert!(clean(&h));
     }

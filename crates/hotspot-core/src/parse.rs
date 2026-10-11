@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::models::{ChannelInfo, WifiAdapter};
 
 
@@ -85,6 +87,22 @@ pub fn supports_ap_sta(out: &str) -> bool {
         .any(|combo| combo.contains("managed") && combo.split(|c: char| !c.is_alphanumeric() && c != '-').any(|w| w == "AP"))
 }
 
+/// `nft -j list set ip <table> <set>` -> bytes per element, for sets updated with `{ ip daddr counter }`.
+pub fn nft_set_counters(json: &str) -> HashMap<String, u64> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return HashMap::new() };
+    v["nftables"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["set"]["elem"].as_array())
+        .flatten()
+        .filter_map(|e| {
+            let e = &e["elem"];
+            Some((e["val"].as_str()?.to_string(), e["counter"]["bytes"].as_u64()?))
+        })
+        .collect()
+}
+
 fn between<'a>(s: &'a str, start: &str, end: &str) -> Option<&'a str> {
     let i = s.find(start)? + start.len();
     let j = s[i..].find(end)? + i;
@@ -163,6 +181,18 @@ Wiphy phy0
         // 6 GHz channel 1 (disabled) must not affect 2.4 GHz channel 1
         assert_eq!(class(5955), ChannelClass::Disabled);
         assert_eq!(chans.iter().filter(|c| c.number == 1).count(), 2);
+    }
+
+    #[test]
+    fn nft_counters() {
+        let json = r#"{"nftables": [{"metainfo": {"json_schema_version": 1}}, {"set": {"family": "ip", "name": "usage_down",
+            "table": "hsnat", "type": "ipv4_addr", "flags": ["dynamic"], "elem": [
+            {"elem": {"val": "192.168.12.100", "counter": {"packets": 12, "bytes": 3400}}},
+            {"elem": {"val": "192.168.12.101", "counter": {"packets": 1, "bytes": 60}}}]}}]}"#;
+        let c = nft_set_counters(json);
+        assert_eq!(c["192.168.12.100"], 3400);
+        assert_eq!(c.len(), 2);
+        assert!(nft_set_counters("not json").is_empty());
     }
 
     #[test]

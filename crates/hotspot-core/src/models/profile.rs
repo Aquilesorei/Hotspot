@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
@@ -7,10 +8,19 @@ use std::path::{Path, PathBuf};
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
-use crate::constants::{BAND_5GHZ_MIN_MHZ, DEFAULT_DNS, DEFAULT_SUBNET, PASSPHRASE_LEN, PROFILES_FILE, SSID_LEN};
-use super::normalize_mac;
+use crate::constants::{
+    BAND_5GHZ_MIN_MHZ, DEFAULT_DNS, DEFAULT_SUBNET, GENERATED_PASSPHRASE_LEN, MAX_CLIENTS, PASSPHRASE_ALPHABET, PASSPHRASE_LEN, PROFILES_FILE, SSID_LEN,
+};
+use super::{normalize_mac, BlockedDevice};
 use crate::error::{HotspotError as E, Result};
 
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct FieldErrors {
+    pub name: Option<String>,
+    pub ssid: Option<String>,
+    pub passphrase: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotspotProfile {
@@ -22,7 +32,15 @@ pub struct HotspotProfile {
     #[serde(default = "default_dns")]
     pub upstream_dns: Vec<IpAddr>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub blocked: Vec<String>,
+    pub blocked: Vec<BlockedDevice>,
+    /// Names given by the user, by MAC.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<String, String>,
+    /// SSID not broadcast.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_clients: Option<u32>,
 }
 
 fn default_subnet() -> Ipv4Net { DEFAULT_SUBNET.parse().unwrap() }
@@ -36,6 +54,9 @@ impl HotspotProfile {
             subnet: default_subnet(),
             upstream_dns: default_dns(),
             blocked: Vec::new(),
+            aliases: BTreeMap::new(),
+            hidden: false,
+            max_clients: None,
         }
     }
 
@@ -44,15 +65,16 @@ impl HotspotProfile {
     pub fn validate(&self) -> Result<()> {
         self.validate_ssid()?;
         self.validate_passphrase()?;
-        for mac in &self.blocked {
-            normalize_mac(mac)?;
+        self.validate_name()?;
+        for b in &self.blocked {
+            normalize_mac(&b.mac)?;
         }
-
-        if self.name.trim().is_empty() {
-            return Err(E::invalid_profile("profile name is required"));
-        }
-        if self.name == self.ssid {
-            return Err(E::invalid_profile("profile name must differ from the SSID"));
+        if self.max_clients.is_some_and(|n| !MAX_CLIENTS.contains(&n)) {
+            return Err(E::invalid_profile(format!(
+                "max devices must be {} to {}",
+                MAX_CLIENTS.start(),
+                MAX_CLIENTS.end()
+            )));
         }
         if self.subnet.prefix_len() != 24 {
             return Err(E::invalid_profile("subnet: only /24 is supported in v1"));
@@ -63,13 +85,38 @@ impl HotspotProfile {
         Ok(())
     }
 
+    /// Per-field messages, for a form.
+    pub fn field_errors(&self) -> FieldErrors {
+        let msg = |r: Result<()>| {
+            r.err().map(|e| match e {
+                E::InvalidProfile(m) => m,
+                e => e.to_string(),
+            })
+        };
+        FieldErrors {
+            name: msg(self.validate_name()),
+            ssid: msg(self.validate_ssid()),
+            passphrase: msg(self.validate_passphrase()),
+        }
+    }
+
+    fn validate_name(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(E::invalid_profile("profile name is required"));
+        }
+        if self.name == self.ssid {
+            return Err(E::invalid_profile("profile name must differ from the network name"));
+        }
+        Ok(())
+    }
+
     fn validate_ssid(&self) -> Result<()> {
 
         if !SSID_LEN.contains(&self.ssid.len()) {
-            return Err(E::invalid_profile(format!("SSID: {} to {} bytes", SSID_LEN.start(), SSID_LEN.end())));
+            return Err(E::invalid_profile(format!("network name must be {} to {} bytes", SSID_LEN.start(), SSID_LEN.end())));
         }
         if self.ssid.chars().any(char::is_control) {
-            return Err(E::invalid_profile("SSID: control characters are not allowed"));
+            return Err(E::invalid_profile("network name can't contain control characters"));
         }
         Ok(())
     }
@@ -80,7 +127,7 @@ impl HotspotProfile {
 
         if !(len_ok && printable_ascii) {
             return Err(E::invalid_profile(format!(
-                "passphrase: {} to {} printable ASCII characters",
+                "password must be {} to {} printable ASCII characters",
                 PASSPHRASE_LEN.start(),
                 PASSPHRASE_LEN.end()
             )));
@@ -96,17 +143,48 @@ impl HotspotProfile {
     /// `ctrl_dir`: control socket directory used by `hostapd_cli`.
     pub fn hostapd_conf(&self, ap: &str, channel: u32, freq_mhz: u32, ctrl_dir: &Path) -> String {
         let hw_mode = if freq_mhz < BAND_5GHZ_MIN_MHZ { "g" } else { "a" };
-        format!(
+        let mut conf = format!(
             "interface={ap}\ndriver=nl80211\nssid={}\nhw_mode={hw_mode}\nchannel={channel}\nieee80211n=1\n\
              wpa=2\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\nwpa_passphrase={}\nctrl_interface={}\n",
             self.ssid,
             self.passphrase,
             ctrl_dir.display()
-        )
+        );
+        if self.hidden {
+            conf.push_str("ignore_broadcast_ssid=1\n");
+        }
+        if let Some(n) = self.max_clients {
+            conf.push_str(&format!("max_num_sta={n}\n"));
+        }
+        conf
+    }
+
+    /// The name to show for a device: the user's alias, else what DHCP reported.
+    pub fn display_name(&self, mac: &str, hostname: Option<&str>) -> Option<String> {
+        self.aliases.get(mac).cloned().or(hostname.map(String::from))
     }
 }
 
 pub(crate) fn offset(a: Ipv4Addr, n: u32) -> Ipv4Addr { Ipv4Addr::from(u32::from(a) + n) }
+
+/// Random passphrase from /dev/urandom, without look-alike characters.
+pub fn generate_passphrase() -> Result<String> {
+    let mut urandom = fs::File::open("/dev/urandom")?;
+    let mut out = String::with_capacity(GENERATED_PASSPHRASE_LEN);
+    // only bytes below a multiple of the alphabet size, so every character is equally likely
+    let limit = 256 - 256 % PASSPHRASE_ALPHABET.len();
+    let mut buf = [0u8; 64];
+    while out.len() < GENERATED_PASSPHRASE_LEN {
+        std::io::Read::read_exact(&mut urandom, &mut buf)?;
+        for &b in buf.iter().filter(|&&b| (b as usize) < limit) {
+            if out.len() == GENERATED_PASSPHRASE_LEN {
+                break;
+            }
+            out.push(PASSPHRASE_ALPHABET[b as usize % PASSPHRASE_ALPHABET.len()] as char);
+        }
+    }
+    Ok(out)
+}
 
 /// The user behind sudo or pkexec, from /etc/passwd (name:x:uid:gid:gecos:home:shell).
 fn invoking_passwd() -> Option<Vec<String>> {
@@ -234,6 +312,35 @@ mod tests {
         assert!(p("Test\nchannel=1", "motdepasse").validate().is_err());
         assert!(p("Test", "motde\npasse").validate().is_err());
         assert!(p("maison", "motdepasse").validate().is_err());
+    }
+
+    #[test]
+    fn field_errors_point_at_the_field() {
+        let e = HotspotProfile::new("", "TestHS", "court").field_errors();
+        assert!(e.name.is_some() && e.ssid.is_none() && e.passphrase.is_some());
+        assert_eq!(p("TestHS", "motdepasse").field_errors(), FieldErrors::default());
+    }
+
+    #[test]
+    fn generated_passphrases_are_valid_and_differ() {
+        let a = generate_passphrase().unwrap();
+        let b = generate_passphrase().unwrap();
+        assert_ne!(a, b);
+        assert!(p("TestHS", &a).validate().is_ok());
+        assert!(a.bytes().all(|c| PASSPHRASE_ALPHABET.contains(&c)));
+    }
+
+    #[test]
+    fn hidden_and_max_clients_in_hostapd_conf() {
+        let mut prof = p("T", "motdepasse");
+        let ctrl = Path::new("/run/x/hostapd");
+        assert!(!prof.hostapd_conf("ap0", 1, 2412, ctrl).contains("ignore_broadcast_ssid"));
+        prof.hidden = true;
+        prof.max_clients = Some(5);
+        let conf = prof.hostapd_conf("ap0", 1, 2412, ctrl);
+        assert!(conf.contains("ignore_broadcast_ssid=1\n") && conf.contains("max_num_sta=5\n"));
+        prof.max_clients = Some(0);
+        assert!(prof.validate().is_err());
     }
 
     #[test]

@@ -1,0 +1,39 @@
+import { Palette } from "std-widgets.slint";
+
+// Tokens from design.md §2. Follows the system light/dark setting.
+export global Theme {
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+
+    out property <color> bg: dark ? #14171A : #F3F4F6;
+    out property <color> surface: dark ? #1D2125 : #FFFFFF;
+    out property <color> surface-2: dark ? #262B31 : #ECEEF1;
+    out property <color> surface-3: dark ? #4A525C : #D5DAE0;
+    out property <color> border: dark ? #2F353C : #DCE0E5;
+    out property <color> border-control: dark ? #6B7480 : #848E9A;
+    out property <color> text: dark ? #E9ECEF : #1A1E23;
+    out property <color> text-2: dark ? #A7AFB9 : #4A5360;
+    out property <color> accent: dark ? #5CBDD0 : #0F6B7C;
+    out property <color> on-accent: dark ? #08262D : #FFFFFF;
+    out property <color> accent-soft: dark ? #17353D : #DDEFF3;
+    out property <color> danger-fill: dark ? #F4A19B : #B3261E;
+    out property <color> on-danger-fill: dark ? #2A0F0D : #FFFFFF;
+    out property <color> ok: dark ? #6CCB97 : #1B6E43;
+    out property <color> ok-soft: dark ? #16301F : #E1F2E8;
+    out property <color> warn: dark ? #F0D58A : #6B4700;
+    out property <color> warn-soft: dark ? #352B10 : #FFF3D1;
+    out property <color> warn-border: dark ? #6B5A25 : #E3C46A;
+    out property <color> error: dark ? #F4A19B : #A8261D;
+    out property <color> error-soft: dark ? #3A1D1B : #FCE9E7;
+    out property <color> error-border: dark ? #6B3431 : #EBB4AF;
+    out property <color> info: dark ? #A9D6EE : #164B66;
+    out property <color> info-soft: dark ? #162E3C : #E3F0F7;
+    out property <color> info-border: dark ? #2C5870 : #A9CBE0;
+    out property <color> disabled-bg: dark ? #2A2F35 : #E4E7EB;
+    out property <color> disabled-text: dark ? #76808B : #78818D;
+
+    out property <length> title: 16px;
+    out property <length> body: 14px;
+    out property <length> small: 13px;
+    out property <length> caption: 12px;
+    out property <string> mono: "Source Code Pro";
+}

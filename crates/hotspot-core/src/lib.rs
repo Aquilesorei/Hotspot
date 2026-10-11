@@ -10,7 +10,7 @@ mod system;
 
 pub use network_backend::NetworkBackend;
 pub use error::{HotspotError, Result};
-pub use constants::RUNTIME_DIR;
+pub use constants::{CONTROL_SOCKET, RUNTIME_DIR, SERVICE_GROUP};
 pub use hotspot::Hotspot;
 pub use models::*;
 pub use system::SystemBackend;

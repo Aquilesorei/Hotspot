@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Child;
 
@@ -36,6 +37,10 @@ pub trait NetworkBackend {
     /// Drops forwarded traffic from one client. `mac` must be normalized.
     fn nft_cut_mac(&self, mac: &str, cut: bool) -> Result<()>;
     fn nft_nat_present(&self) -> bool;
+    /// Bytes forwarded to and from each client IP since the table was created: ip -> (down, up).
+    fn nft_usage(&self) -> Result<HashMap<String, (u64, u64)>>;
+    /// Replaces every speed limit on `ap` with `limits` (client IP, Mbit/s), down and up.
+    fn tc_limits(&self, ap: &str, limits: &[(String, u32)]) -> Result<()>;
     fn forward_blocked(&self) -> bool;
 
     fn iptables(&self, args: &[&str]) -> Result<bool>;

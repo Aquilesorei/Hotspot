@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use super::{Client, UplinkInfo};
+use super::{BlockedDevice, Client, UplinkInfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -17,7 +17,7 @@ pub struct Status {
     pub ap_channel: Option<u32>,
     pub clients: Vec<Client>,
     pub internet_cut_all: bool,
-    pub blocked: Vec<String>,
+    pub blocked: Vec<BlockedDevice>,
     pub forwarding: Forwarding,
 }
 

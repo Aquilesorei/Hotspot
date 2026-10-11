@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::{Child, Stdio};
@@ -9,7 +10,7 @@ use crate::error::{HotspotError, Result};
 use crate::models::{DnsmasqArgs, PhyCaps, UplinkInfo, WifiAdapter};
 use crate::parse;
 use crate::constants::{
-    bin, AP_IFACE, CUT_IFACES_SET, CUT_MACS_SET, DHCP_LEASE, FWD_CHAIN, INPUT_CHAIN, IP_FORWARD, KILL_POLL, KILL_TIMEOUT, NAT_TABLE,
+    bin, AP_IFACE, CUT_IFACES_SET, CUT_MACS_SET, USAGE_DOWN_SET, USAGE_UP_SET, DHCP_LEASE, FWD_CHAIN, INPUT_CHAIN, IP_FORWARD, KILL_POLL, KILL_TIMEOUT, NAT_TABLE,
     NM_UNMANAGED_CONF_PATH,
 };
 use crate::runner::{command, run, run_ok, run_unit, succeeds};
@@ -37,7 +38,7 @@ fn nm_unmanaged_conf() -> String {
     format!("[keyfile]\nunmanaged-devices=interface-name:{AP_IFACE}\n")
 }
 
-/// `Ok(false)` if the file was already in place (no reload).
+
 fn install_unmanaged_conf(conf_path: &Path) -> Result<bool> {
     let conf = nm_unmanaged_conf();
     if fs::read_to_string(conf_path).is_ok_and(|current| current == conf) {
@@ -141,7 +142,9 @@ impl NetworkBackend for SystemBackend {
         let _ = run(bin::NFT, &["delete", "table", "ip", NAT_TABLE]);
         let cut_ifaces = format!("@{CUT_IFACES_SET}");
         let cut_macs = format!("@{CUT_MACS_SET}");
-        let steps: [&[&str]; 14] = [
+        let usage_down = format!("@{USAGE_DOWN_SET}");
+        let usage_up = format!("@{USAGE_UP_SET}");
+        let steps: [&[&str]; 18] = [
             &["add", "table", "ip", NAT_TABLE],
             &["add", "chain", "ip", NAT_TABLE, "post", "{ type nat hook postrouting priority 100; }"],
             &["add", "rule", "ip", NAT_TABLE, "post", "oifname", uplink, "masquerade"],
@@ -151,6 +154,11 @@ impl NetworkBackend for SystemBackend {
             &["add", "chain", "ip", NAT_TABLE, FWD_CHAIN, "{ type filter hook forward priority 0; }"],
             &["add", "rule", "ip", NAT_TABLE, FWD_CHAIN, "iifname", &cut_ifaces, "drop"],
             &["add", "rule", "ip", NAT_TABLE, FWD_CHAIN, "ether", "saddr", &cut_macs, "drop"],
+            // after the drops, so cut traffic isn't counted
+            &["add", "set", "ip", NAT_TABLE, USAGE_DOWN_SET, "{ type ipv4_addr; size 65535; flags dynamic; }"],
+            &["add", "set", "ip", NAT_TABLE, USAGE_UP_SET, "{ type ipv4_addr; size 65535; flags dynamic; }"],
+            &["add", "rule", "ip", NAT_TABLE, FWD_CHAIN, "oifname", AP_IFACE, "update", &usage_down, "{ ip daddr counter }"],
+            &["add", "rule", "ip", NAT_TABLE, FWD_CHAIN, "iifname", AP_IFACE, "update", &usage_up, "{ ip saddr counter }"],
             // clients may only reach DHCP and DNS on this computer: the firewalld zone `trusted`
             // would otherwise expose every local service (SSH, dev servers…)
             &["add", "chain", "ip", NAT_TABLE, INPUT_CHAIN, "{ type filter hook input priority 0; }"],
@@ -177,6 +185,42 @@ impl NetworkBackend for SystemBackend {
 
     fn nft_nat_present(&self) -> bool {
         succeeds(bin::NFT, &["list", "table", "ip", NAT_TABLE])
+    }
+
+    fn nft_usage(&self) -> Result<HashMap<String, (u64, u64)>> {
+        let read = |set| -> Result<HashMap<String, u64>> {
+            Ok(parse::nft_set_counters(&run_ok(bin::NFT, &["-j", "list", "set", "ip", NAT_TABLE, set])?.stdout))
+        };
+        let (down, up) = (read(USAGE_DOWN_SET)?, read(USAGE_UP_SET)?);
+        let ips: std::collections::BTreeSet<&String> = down.keys().chain(up.keys()).collect();
+        Ok(ips
+            .into_iter()
+            .map(|ip| (ip.clone(), (down.get(ip).copied().unwrap_or(0), up.get(ip).copied().unwrap_or(0))))
+            .collect())
+    }
+
+    fn tc_limits(&self, ap: &str, limits: &[(String, u32)]) -> Result<()> {
+        let _ = run(bin::TC, &["qdisc", "del", "dev", ap, "root"]);
+        let _ = run(bin::TC, &["qdisc", "del", "dev", ap, "ingress"]);
+        if limits.is_empty() {
+            return Ok(());
+        }
+        let tc = |args: &[&str]| run_unit(bin::TC, args);
+        // down: htb classes on ap0's egress; up: policing on its ingress (no ifb needed)
+        tc(&["qdisc", "add", "dev", ap, "root", "handle", "1:", "htb", "default", "1"])?;
+        tc(&["class", "add", "dev", ap, "parent", "1:", "classid", "1:1", "htb", "rate", "10gbit"])?;
+        tc(&["qdisc", "add", "dev", ap, "handle", "ffff:", "ingress"])?;
+        for (i, (ip, mbps)) in limits.iter().enumerate() {
+            let ip: std::net::Ipv4Addr = ip.parse().map_err(|_| HotspotError::command(bin::TC, format!("bad client IP {ip}")))?;
+            let host = format!("{ip}/32");
+            let class = format!("1:{:x}", i + 16);
+            let rate = format!("{mbps}mbit");
+            tc(&["class", "add", "dev", ap, "parent", "1:", "classid", &class, "htb", "rate", &rate, "ceil", &rate])?;
+            tc(&["filter", "add", "dev", ap, "parent", "1:", "protocol", "ip", "prio", "1", "u32", "match", "ip", "dst", &host, "flowid", &class])?;
+            tc(&["filter", "add", "dev", ap, "parent", "ffff:", "protocol", "ip", "prio", "1", "u32", "match", "ip", "src", &host,
+                "police", "rate", &rate, "burst", "64k", "drop", "flowid", ":1"])?;
+        }
+        Ok(())
     }
 
     fn forward_blocked(&self) -> bool {
