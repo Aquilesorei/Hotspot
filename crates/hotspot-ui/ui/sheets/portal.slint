@@ -1,0 +1,334 @@
+import { CheckBox, ComboBox, LineEdit, ScrollView } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { Banner, Button, ButtonKind, Card, Chip, Divider, IconButton, NoticeKind, PopupItem } from "../components.slint";
+import { AppState, CouponRow, UserRow } from "../state.slint";
+import { SheetHeader } from "sheet-header.slint";
+
+export component CouponRowView inherits Rectangle {
+    in property <CouponRow> coupon;
+    min-height: row.preferred-height;
+    row := HorizontalLayout {
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 12px;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: root.coupon.code;
+                color: root.coupon.state-kind >= 2 ? Theme.text-2 : Theme.text;
+                font-family: Theme.mono;
+                font-size: Theme.title;
+                font-weight: 700;
+            }
+            Text {
+                text: "\{root.coupon.duration} · \{root.coupon.mode} · \{root.coupon.devices}";
+                color: Theme.text-2;
+                font-size: Theme.caption;
+            }
+            if root.coupon.left != "": Text {
+                text: root.coupon.left;
+                color: Theme.text-2;
+                font-size: Theme.caption;
+            }
+        }
+        Chip {
+            text: root.coupon.state;
+            neutral: root.coupon.state-kind == 0;
+            kind: root.coupon.state-kind == 1 ? NoticeKind.info : root.coupon.state-kind == 3 ? NoticeKind.error : NoticeKind.warn;
+            y: (parent.height - self.height) / 2;
+        }
+        VerticalLayout {
+            alignment: center;
+            more := IconButton {
+                icon: @image-url("../icons/more.svg");
+                label: "Coupon actions";
+                clicked => { menu.show(); }
+            }
+        }
+    }
+    menu := PopupWindow {
+        x: root.width - 200px;
+        y: root.height - 4px;
+        width: 200px;
+        Rectangle {
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border-control;
+            border-radius: 8px;
+            VerticalLayout {
+                padding: 4px;
+                PopupItem {
+                    text: "Copy code";
+                    icon: @image-url("../icons/copy.svg");
+                    clicked => { AppState.coupon-action(root.coupon.code, "copy"); }
+                }
+                PopupItem {
+                    text: "Add 1 hour";
+                    icon: @image-url("../icons/clock.svg");
+                    enabled: root.coupon.state-kind != 3;
+                    clicked => { AppState.coupon-action(root.coupon.code, "extend"); }
+                }
+                PopupItem {
+                    text: "Revoke";
+                    icon: @image-url("../icons/ban.svg");
+                    danger: true;
+                    enabled: root.coupon.state-kind != 3;
+                    clicked => { AppState.coupon-action(root.coupon.code, "revoke"); }
+                }
+            }
+        }
+    }
+}
+
+export component CouponsSheet inherits VerticalLayout {
+    SheetHeader {
+        back: true;
+        title: "Coupons";
+        subtitle: "Profile: \{AppState.current.name}";
+    }
+    ScrollView {
+        // no sideways scrolling: content wraps or shrinks to the window
+        content-width: self.visible-width;
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+            alignment: start;
+            if !AppState.service: Banner {
+                kind: NoticeKind.warn;
+                title: "Coupons need the background service";
+                body: "Run ./install.sh --service, then log out and back in once.";
+                dismissible: false;
+            }
+            Card {
+                pad-v: 16px;
+                VerticalLayout {
+                    spacing: 10px;
+                    Text {
+                        text: "Create coupons";
+                        color: Theme.text;
+                        font-size: Theme.title;
+                        font-weight: 700;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout {
+                            spacing: 4px;
+                            Text {
+                                text: "How many";
+                                color: Theme.text-2;
+                                font-size: Theme.caption;
+                            }
+                            LineEdit {
+                                text <=> AppState.cf-count;
+                                input-type: InputType.number;
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 4px;
+                            Text {
+                                text: "Duration";
+                                color: Theme.text-2;
+                                font-size: Theme.caption;
+                            }
+                            ComboBox {
+                                model: AppState.coupon-durations;
+                                current-index <=> AppState.cf-duration;
+                            }
+                        }
+                    }
+                    if AppState.cf-duration == AppState.coupon-durations.length - 1: LineEdit {
+                        text <=> AppState.cf-custom;
+                        placeholder-text: "Custom duration in minutes";
+                        input-type: InputType.number;
+                    }
+                    VerticalLayout {
+                        spacing: 4px;
+                        Text {
+                            text: "Devices per coupon";
+                            color: Theme.text-2;
+                            font-size: Theme.caption;
+                        }
+                        LineEdit {
+                            text <=> AppState.cf-devices;
+                            input-type: InputType.number;
+                        }
+                    }
+                    CheckBox {
+                        text: "Count only connected time";
+                        checked <=> AppState.cf-connected;
+                    }
+                    if AppState.cf-error != "": Text {
+                        text: AppState.cf-error;
+                        color: Theme.error;
+                        font-size: Theme.caption;
+                        wrap: word-wrap;
+                    }
+                    Button {
+                        text: "Create";
+                        enabled: AppState.service;
+                        clicked => { AppState.create-coupons(); }
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: "\{AppState.coupons.length} coupons";
+                    color: Theme.text-2;
+                    font-size: Theme.small;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Button {
+                    text: "Export CSV";
+                    kind: ButtonKind.secondary;
+                    small: true;
+                    enabled: AppState.coupons.length > 0;
+                    clicked => { AppState.export-coupons(); }
+                }
+            }
+            if AppState.coupons.length > 0: Card {
+                for coupon[i] in AppState.coupons: VerticalLayout {
+                    if i > 0: Divider { }
+                    CouponRowView {
+                        coupon: coupon;
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component UserRowView inherits Rectangle {
+    in property <UserRow> user;
+    property <bool> open;
+    min-height: col.preferred-height;
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.open = !root.open; }
+    }
+    col := VerticalLayout {
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 2px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: root.user.name;
+                color: root.user.status-kind == 0 ? Theme.text : Theme.text-2;
+                font-size: Theme.body;
+                font-weight: 600;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            Chip {
+                text: root.user.status;
+                neutral: root.user.status-kind == 3;
+                kind: root.user.status-kind == 0 ? NoticeKind.info : root.user.status-kind == 2 ? NoticeKind.error : NoticeKind.warn;
+            }
+        }
+        Text {
+            text: "\{root.user.phone} · coupon \{root.user.coupon}";
+            color: Theme.text-2;
+            font-size: Theme.caption;
+        }
+        Text {
+            text: root.user.left != "" ? "\{root.user.left} · last seen \{root.user.last}" : "Last seen \{root.user.last}";
+            color: Theme.text-2;
+            font-size: Theme.caption;
+        }
+        if root.open: VerticalLayout {
+            padding-top: 8px;
+            spacing: 2px;
+            Text {
+                text: "MAC \{root.user.mac}" + (root.user.ip != "" ? " · IP \{root.user.ip}" : "");
+                color: Theme.text-2;
+                font-family: Theme.mono;
+                font-size: Theme.caption;
+            }
+            Text {
+                text: "First sign-in \{root.user.first}";
+                color: Theme.text-2;
+                font-size: Theme.caption;
+            }
+            Text {
+                text: "History";
+                color: Theme.text;
+                font-size: Theme.small;
+                font-weight: 600;
+            }
+            for line in root.user.history: Text {
+                text: line;
+                color: Theme.text-2;
+                font-size: Theme.caption;
+            }
+            if root.user.status-kind == 0 && AppState.current.name == AppState.running-profile: HorizontalLayout {
+                alignment: start;
+                padding-top: 6px;
+                Button {
+                    text: "End session";
+                    kind: ButtonKind.secondary;
+                    small: true;
+                    clicked => { AppState.end-session(root.user.mac); }
+                }
+            }
+        }
+    }
+}
+
+export component UsersSheet inherits VerticalLayout {
+    SheetHeader {
+        back: true;
+        title: "Users";
+        subtitle: "Profile: \{AppState.current.name}";
+    }
+    ScrollView {
+        // no sideways scrolling: content wraps or shrinks to the window
+        content-width: self.visible-width;
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+            alignment: start;
+            if !AppState.service: Banner {
+                kind: NoticeKind.warn;
+                title: "Users need the background service";
+                body: "Run ./install.sh --service, then log out and back in once.";
+                dismissible: false;
+            }
+            LineEdit {
+                text <=> AppState.users-filter;
+                placeholder-text: "Search name, phone, coupon, MAC or IP";
+                edited => { AppState.filter-users(); }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: AppState.users.length == 0 ? (AppState.users-filter == "" ? "No one has signed in yet." : "No match.")
+                        : "\{AppState.users.length} sign-ins · tap one for details. Kept 30 days after they end.";
+                    color: Theme.text-2;
+                    font-size: Theme.small;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Button {
+                    text: "Export CSV";
+                    kind: ButtonKind.secondary;
+                    small: true;
+                    enabled: AppState.users.length > 0;
+                    clicked => { AppState.export-users(); }
+                }
+            }
+            if AppState.users.length > 0: Card {
+                for user[i] in AppState.users: VerticalLayout {
+                    if i > 0: Divider { }
+                    UserRowView {
+                        user: user;
+                    }
+                }
+            }
+        }
+    }
+}

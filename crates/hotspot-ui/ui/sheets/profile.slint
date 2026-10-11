@@ -1,0 +1,190 @@
+import { CheckBox, ComboBox, ScrollView } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { Banner, Button, ButtonKind, Chip, Divider, FormField, NoticeKind } from "../components.slint";
+import { AppState, Dialog, Phase, Sheet } from "../state.slint";
+import { SheetHeader } from "sheet-header.slint";
+
+export component ProfileSheet inherits VerticalLayout {
+    SheetHeader {
+        title: AppState.sheet == Sheet.profile-new ? "New profile" : "Edit profile";
+    }
+    ScrollView {
+        // no sideways scrolling: content wraps or shrinks to the window
+        content-width: self.visible-width;
+        VerticalLayout {
+            padding: 16px;
+            spacing: 16px;
+            alignment: start;
+            if AppState.editing-running: Banner {
+                kind: NoticeKind.info;
+                title: "The hotspot is running";
+                body: "Changing the network name or password restarts it and disconnects all devices.";
+                dismissible: false;
+            }
+            FormField {
+                label: "Profile name";
+                enabled: !AppState.editing-running && !(AppState.sheet == Sheet.profile-edit && AppState.form-portal);
+                hint: AppState.sheet == Sheet.profile-edit && AppState.form-portal ? "Portal profiles keep their coupons under this name, so it can't change."
+                    : AppState.editing-running ? "Stop the hotspot to rename this profile." : "";
+                text <=> AppState.form-name;
+                error: AppState.form-attempted ? AppState.form-name-error : "";
+                edited => { AppState.form-changed(); }
+            }
+            FormField {
+                label: "Network name";
+                hint: "1 to 32 bytes";
+                counter: "\{AppState.form-ssid-bytes} / 32";
+                text <=> AppState.form-ssid;
+                error: AppState.form-attempted ? AppState.form-ssid-error : "";
+                edited => { AppState.form-changed(); }
+            }
+            if AppState.sheet == Sheet.profile-new: VerticalLayout {
+                spacing: 6px;
+                Text {
+                    text: "Profile type";
+                    color: Theme.text;
+                    font-size: Theme.small;
+                    font-weight: 600;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button {
+                        horizontal-stretch: 1;
+                        small: true;
+                        text: "Password";
+                        kind: AppState.form-portal ? ButtonKind.secondary : ButtonKind.primary;
+                        clicked => {
+                            AppState.form-portal = false;
+                            AppState.form-changed();
+                        }
+                    }
+                    Button {
+                        horizontal-stretch: 1;
+                        small: true;
+                        text: "Portal with coupons";
+                        kind: AppState.form-portal ? ButtonKind.primary : ButtonKind.secondary;
+                        clicked => {
+                            AppState.form-portal = true;
+                            AppState.form-changed();
+                        }
+                    }
+                }
+                Text {
+                    text: AppState.form-portal
+                        ? "Open Wi-Fi: devices get internet after entering their details and a coupon code. Can't be changed later."
+                        : "Devices join with a password. Can't be changed into a portal later.";
+                    color: Theme.text-2;
+                    font-size: Theme.caption;
+                    wrap: word-wrap;
+                }
+            }
+            if AppState.sheet == Sheet.profile-edit: Chip {
+                text: AppState.form-portal ? "Portal profile · open network" : "Password profile";
+                has-icon: true;
+                icon: @image-url("../icons/lock.svg");
+            }
+            if AppState.form-portal: VerticalLayout {
+                spacing: 6px;
+                Text {
+                    text: "Default country";
+                    color: Theme.text;
+                    font-size: Theme.small;
+                    font-weight: 600;
+                }
+                ComboBox {
+                    model: AppState.country-labels;
+                    current-index <=> AppState.form-country;
+                }
+                Text {
+                    text: "Its calling code is preselected in the sign-in form. People can still pick another.";
+                    color: Theme.text-2;
+                    font-size: Theme.caption;
+                    wrap: word-wrap;
+                }
+            }
+            if AppState.form-portal: FormField {
+                label: "Default devices per coupon";
+                error: AppState.form-portal-error;
+                text <=> AppState.form-devices;
+                edited => { AppState.form-changed(); }
+            }
+            if AppState.form-portal: CheckBox {
+                text: "New coupons count only connected time";
+                checked <=> AppState.form-connected;
+            }
+            if AppState.form-portal: FormField {
+                label: "Coupon durations offered";
+                hint: "Separated by commas, e.g. 30 min, 2 h, 3 days, 1 week. \"Custom…\" is always offered too.";
+                text <=> AppState.form-durations;
+                edited => { AppState.form-changed(); }
+            }
+            if !AppState.form-portal: FormField {
+                label: "Password";
+                hint: "8 to 63 characters";
+                counter: "\{AppState.form-password.character-count} / 63";
+                password: true;
+                revealed: AppState.form-password-revealed;
+                text <=> AppState.form-password;
+                error: AppState.form-attempted ? AppState.form-password-error : "";
+                can-generate: true;
+                edited => { AppState.form-changed(); }
+                toggle-reveal => { AppState.form-password-revealed = !AppState.form-password-revealed; }
+                generate => { AppState.generate-password(); }
+            }
+            VerticalLayout {
+                spacing: 4px;
+                CheckBox {
+                    text: "Hidden network";
+                    checked <=> AppState.form-hidden;
+                }
+                Text {
+                    text: "Devices have to type the network name to join. The QR code still works.";
+                    color: Theme.text-2;
+                    font-size: Theme.caption;
+                    wrap: word-wrap;
+                }
+            }
+            FormField {
+                label: "Max devices";
+                hint: "Leave empty for no limit";
+                text <=> AppState.form-max;
+                error: AppState.form-max-error;
+                edited => { AppState.form-changed(); }
+            }
+        }
+    }
+    Rectangle {
+        background: Theme.surface;
+        Divider {
+            y: 0;
+        }
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 12px;
+            padding-bottom: 16px;
+            spacing: 8px;
+            if AppState.sheet == Sheet.profile-edit: Button {
+                text: "Delete profile";
+                kind: ButtonKind.secondary-danger;
+                enabled: !(AppState.phase == Phase.running && AppState.current.name == AppState.running-profile);
+                clicked => { AppState.dialog = Dialog.delete; }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: "Cancel";
+                kind: ButtonKind.secondary;
+                clicked => { AppState.close-sheet(); }
+            }
+            Button {
+                text: "Save";
+                clicked => {
+                    AppState.form-attempted = true;
+                    if AppState.form-valid {
+                        AppState.save-profile();
+                    }
+                }
+            }
+        }
+    }
+}

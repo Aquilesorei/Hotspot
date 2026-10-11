@@ -1,0 +1,37 @@
+
+
+export component Tray inherits SystemTrayIcon {
+    in property <bool> running;
+    in property <bool> can-start;
+    in property <bool> busy;
+    in-out property <bool> autostart;
+    callback show-window();
+    callback toggle();
+    callback autostart-toggled(bool);
+    callback quit();
+    icon: @image-url("icons/app.svg");
+    title: "Hotspot";
+    tooltip: busy ? "Hotspot: starting…" : running ? "Hotspot is on" : "Hotspot is off";
+    clicked => { root.show-window(); }
+    Menu {
+        MenuItem {
+            title: "Show Hotspot";
+            activated => { root.show-window(); }
+        }
+        MenuItem {
+            title: root.running ? "Stop hotspot" : "Start hotspot";
+            enabled: !root.busy && (root.running || root.can-start);
+            activated => { root.toggle(); }
+        }
+        MenuItem {
+            title: "Start at login";
+            checkable: true;
+            checked <=> root.autostart;
+            activated => { root.autostart-toggled(self.checked); }
+        }
+        MenuItem {
+            title: "Quit";
+            activated => { root.quit(); }
+        }
+    }
+}

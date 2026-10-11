@@ -1,0 +1,85 @@
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { Button, ButtonKind, Card, Chip, Divider, Icon, NoticeKind } from "../components.slint";
+import { AppState } from "../state.slint";
+import { SheetHeader } from "sheet-header.slint";
+
+export component BlockedSheet inherits VerticalLayout {
+    SheetHeader {
+        back: true;
+        title: "Blocked devices";
+        subtitle: "Profile: \{AppState.current.name}";
+    }
+    ScrollView {
+        // no sideways scrolling: content wraps or shrinks to the window
+        content-width: self.visible-width;
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+            alignment: start;
+            if AppState.blocked.length == 0: Text {
+                text: "No blocked devices";
+                color: Theme.text-2;
+                font-size: Theme.body;
+                horizontal-alignment: center;
+            }
+            if AppState.blocked.length > 0: Card {
+                for device[i] in AppState.blocked: VerticalLayout {
+                    if i > 0: Divider { }
+                    VerticalLayout {
+                        padding-top: 12px;
+                        padding-bottom: 12px;
+                        spacing: 10px;
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Rectangle {
+                                width: 40px;
+                                height: 40px;
+                                border-radius: 20px;
+                                background: Theme.error-soft;
+                                Icon {
+                                    source: @image-url("../icons/ban.svg");
+                                    tint: Theme.error;
+                                }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                alignment: center;
+                                Text {
+                                    text: device.name != "" ? device.name : "Unknown device";
+                                    color: device.name != "" ? Theme.text : Theme.text-2;
+                                    font-size: Theme.body;
+                                    font-weight: device.name != "" ? 700 : 600;
+                                }
+                                Text {
+                                    text: device.mac;
+                                    color: Theme.text-2;
+                                    font-family: Theme.mono;
+                                    font-size: Theme.caption;
+                                }
+                            }
+                            Chip {
+                                text: "Blocked";
+                                neutral: false;
+                                kind: NoticeKind.error;
+                                y: (parent.height - self.height) / 2;
+                            }
+                        }
+                        Button {
+                            text: "Unblock";
+                            kind: ButtonKind.secondary;
+                            small: true;
+                            clicked => { AppState.unblock(device.mac); }
+                        }
+                    }
+                }
+            }
+            Text {
+                text: "Blocked devices can't join this hotspot. The list is saved with the profile, so it applies whenever you use “\{AppState.current.name}”.";
+                color: Theme.text-2;
+                font-size: Theme.caption;
+                wrap: word-wrap;
+            }
+        }
+    }
+}

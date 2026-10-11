@@ -1,0 +1,54 @@
+import { CheckBox, ScrollView } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { Card } from "../components.slint";
+import { AppState } from "../state.slint";
+import { SheetHeader } from "sheet-header.slint";
+
+export component SettingsSheet inherits VerticalLayout {
+    SheetHeader {
+        back: true;
+        title: "Settings";
+    }
+    ScrollView {
+        content-width: self.visible-width;
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+            alignment: start;
+            Card {
+                pad-v: 12px;
+                VerticalLayout {
+                    spacing: 4px;
+                    CheckBox {
+                        text: "Notifications";
+                        checked <=> AppState.notifications;
+                        toggled => { AppState.set-notifications(self.checked); }
+                    }
+                    Text {
+                        text: "New devices, wrong passwords, portal sign-ins and ended guest access.";
+                        color: Theme.text-2;
+                        font-size: Theme.caption;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+            Card {
+                pad-v: 12px;
+                VerticalLayout {
+                    spacing: 4px;
+                    CheckBox {
+                        text: "Start at login";
+                        checked <=> AppState.autostart;
+                        toggled => { AppState.set-autostart(self.checked); }
+                    }
+                    Text {
+                        text: "Only the tray icon appears; click it to open this window.";
+                        color: Theme.text-2;
+                        font-size: Theme.caption;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+    }
+}

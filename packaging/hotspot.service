@@ -1,0 +1,13 @@
+[Unit]
+Description=Wi-Fi hotspot service (lets the Hotspot app run without asking for a password)
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+ExecStart=/usr/local/bin/hotspot-cli daemon
+# SIGTERM would kill the engine before it cleans up: tear the hotspot down first
+ExecStop=/usr/local/bin/hotspot-cli stop
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

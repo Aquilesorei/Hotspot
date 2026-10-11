@@ -1,0 +1,297 @@
+import { ComboBox, ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { Banner, Button, ButtonKind, Card, Chip, Divider, IconButton, LabeledValue, LinkCard, Row, StatusCard, StatusKind } from "components.slint";
+import { AppState, Phase, Sheet, Unsupported } from "state.slint";
+import { DevicesCard } from "devices.slint";
+
+export component Header inherits Rectangle {
+    height: 64px;
+    background: Theme.surface;
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 8px;
+        ComboBox {
+            model: AppState.profile-labels;
+            current-index: max(AppState.selected, 0);
+            enabled: AppState.phase == Phase.stopped;
+            selected => { AppState.select-profile(self.current-index); }
+        }
+        IconButton {
+            icon: @image-url("icons/edit.svg");
+            label: "Edit profile";
+            enabled: AppState.phase != Phase.no-profile && !AppState.busy && AppState.phase != Phase.stopping;
+            clicked => { AppState.edit-profile(); }
+        }
+        IconButton {
+            icon: @image-url("icons/plus.svg");
+            label: "New profile";
+            enabled: !AppState.busy && AppState.phase != Phase.stopping;
+            clicked => { AppState.new-profile(); }
+        }
+        IconButton {
+            icon: @image-url("icons/settings.svg");
+            label: "Settings";
+            clicked => { AppState.sheet = Sheet.settings; }
+        }
+    }
+    Divider {
+        y: parent.height - 1px;
+    }
+}
+
+export component EmptyState inherits Card {
+    pad-v: 24px;
+    VerticalLayout {
+        spacing: 12px;
+        alignment: center;
+        Text {
+            text: "No profile yet";
+            color: Theme.text;
+            font-size: Theme.title;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "A profile saves the network name and password for your hotspot.";
+            color: Theme.text-2;
+            font-size: Theme.body;
+            wrap: word-wrap;
+            horizontal-alignment: center;
+        }
+        Button {
+            text: "Create a profile";
+            has-icon: true;
+            icon: @image-url("icons/plus.svg");
+            clicked => { AppState.new-profile(); }
+        }
+    }
+}
+
+export component HotspotCard inherits Card {
+    Row {
+        LabeledValue {
+            label: "Network name";
+            value: AppState.current.ssid;
+        }
+    }
+    Divider { }
+    if AppState.current.portal: Row {
+        LabeledValue {
+            label: "Access";
+            value: "Open network · coupon required";
+        }
+    }
+    if !AppState.current.portal: Row {
+        LabeledValue {
+            label: "Password";
+            value: AppState.password-revealed ? AppState.current.password : "••••••••••";
+            mono: AppState.password-revealed;
+        }
+        IconButton {
+            icon: AppState.password-revealed ? @image-url("icons/eye-off.svg") : @image-url("icons/eye.svg");
+            label: AppState.password-revealed ? "Hide password" : "Show password";
+            clicked => { AppState.password-revealed = !AppState.password-revealed; }
+        }
+        IconButton {
+            icon: AppState.copied ? @image-url("icons/check.svg") : @image-url("icons/copy.svg");
+            label: AppState.copied ? "Copied" : "Copy password";
+            clicked => { AppState.copy-password(); }
+        }
+    }
+    if AppState.phase == Phase.running: Divider { }
+    if AppState.phase == Phase.running: VerticalLayout {
+        padding-top: 12px;
+        padding-bottom: 12px;
+        spacing: 12px;
+        if AppState.qr-shown: VerticalLayout {
+            spacing: 8px;
+            alignment: center;
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 216px;
+                    height: 216px;
+                    border-radius: 10px;
+                    background: white;
+                    Image {
+                        width: 200px;
+                        height: 200px;
+                        source: AppState.qr-image;
+                        image-rendering: pixelated;
+                    }
+                }
+            }
+            Text {
+                text: "Scan with a phone camera to join. The QR code contains the password.";
+                color: Theme.text-2;
+                font-size: Theme.caption;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+            }
+        }
+        Button {
+            text: AppState.qr-shown ? "Hide QR code" : "Show QR code";
+            kind: ButtonKind.secondary;
+            small: true;
+            has-icon: true;
+            icon: @image-url("icons/qr.svg");
+            clicked => { AppState.toggle-qr(); }
+        }
+    }
+}
+
+export component UpstreamCard inherits Card {
+    pad-v: 16px;
+    VerticalLayout {
+        spacing: 12px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Upstream Wi-Fi";
+                color: Theme.text;
+                font-size: Theme.title;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Chip {
+                text: "Read-only";
+                has-icon: true;
+                icon: @image-url("icons/lock.svg");
+            }
+            Rectangle { }
+        }
+        GridLayout {
+            spacing: 12px;
+            Row {
+                LabeledValue {
+                    label: "Network";
+                    value: AppState.upstream.connected ? AppState.upstream.ssid : "Not connected";
+                }
+                LabeledValue {
+                    label: "Interface";
+                    value: AppState.upstream.iface != "" ? AppState.upstream.iface : "None";
+                }
+            }
+            Row {
+                LabeledValue {
+                    label: "Channel";
+                    value: AppState.upstream.connected ? "\{AppState.upstream.channel} (\{AppState.upstream.freq-mhz} MHz)" : "None";
+                }
+                LabeledValue {
+                    label: "Band";
+                    value: AppState.upstream.connected ? AppState.upstream.band : "None";
+                }
+            }
+        }
+        if AppState.upstream.connected: Text {
+            text: "Channel and band are set by \{AppState.upstream.ssid} and can't be changed here.";
+            color: Theme.text-2;
+            font-size: Theme.caption;
+            wrap: word-wrap;
+        }
+    }
+}
+
+export component Footer inherits Rectangle {
+    background: Theme.surface;
+    Divider {
+        y: 0;
+    }
+    VerticalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 12px;
+        padding-bottom: 16px;
+        spacing: 8px;
+        property <string> caption: AppState.phase == Phase.no-profile ? "Create a profile to start."
+            : AppState.phase == Phase.running && AppState.service ? "The hotspot keeps running when you close this window."
+            : AppState.phase == Phase.running && AppState.tray ? "Closing this window keeps the hotspot in the tray. Quit from the tray icon stops it."
+            : AppState.phase == Phase.running ? "Closing this window stops the hotspot."
+            : AppState.phase == Phase.stopped && !AppState.upstream.connected ? "Connect to a Wi-Fi network to start."
+            : AppState.phase == Phase.stopped && AppState.current.portal && !AppState.service
+                ? "Portal profiles need the background service: run ./install.sh --service." : "";
+        if caption != "": Text {
+            text: caption;
+            color: Theme.text-2;
+            font-size: Theme.caption;
+            horizontal-alignment: center;
+        }
+        if AppState.phase == Phase.running || AppState.phase == Phase.stopping: Button {
+            text: AppState.phase == Phase.stopping ? "Stopping…" : "Stop hotspot";
+            kind: ButtonKind.danger;
+            enabled: AppState.phase == Phase.running;
+            clicked => { AppState.stop(); }
+        }
+        if AppState.phase != Phase.running && AppState.phase != Phase.stopping: Button {
+            text: AppState.phase == Phase.authorizing ? "Waiting for authorization…" : AppState.phase == Phase.starting ? "Starting…" : "Start hotspot";
+            enabled: AppState.can-start;
+            clicked => { AppState.start(); }
+        }
+    }
+}
+
+export component MainView inherits VerticalLayout {
+    Header { }
+    ScrollView {
+        // no sideways scrolling: content wraps or shrinks to the window
+        content-width: self.visible-width;
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+            alignment: start;
+            for notice in AppState.notices: Banner {
+                kind: notice.kind;
+                title: notice.title;
+                body: notice.body;
+                details: notice.details;
+                dismissible: notice.dismissible;
+                dismissed => { AppState.dismiss-notice(notice.id); }
+            }
+            if AppState.phase == Phase.no-profile: EmptyState { }
+            if AppState.phase != Phase.no-profile: StatusCard {
+                kind: AppState.phase == Phase.running ? (AppState.internet-cut-all ? StatusKind.cut : StatusKind.on)
+                    : AppState.busy ? StatusKind.busy : StatusKind.off;
+                title: AppState.unsupported == Unsupported.no-ap-sta && AppState.idle ? "Hotspot is unavailable"
+                    : AppState.phase == Phase.authorizing ? "Waiting for authorization…"
+                    : AppState.phase == Phase.starting ? "Starting hotspot…"
+                    : AppState.phase == Phase.running && AppState.internet-cut-all ? "Internet is cut for everyone"
+                    : AppState.phase == Phase.running ? "Hotspot is on" : "Hotspot is off";
+                subtitle: AppState.unsupported == Unsupported.no-ap-sta && AppState.idle ? "Your Wi-Fi card doesn't support this."
+                    : AppState.phase == Phase.authorizing ? "Approve the system prompt to continue."
+                    : AppState.phase == Phase.starting ? "This can take up to 10 seconds."
+                    : AppState.phase == Phase.running && AppState.internet-cut-all
+                        ? (AppState.clients.length == 1 ? "Hotspot is on · 1 device stays connected" : "Hotspot is on · \{AppState.clients.length} devices stay connected")
+                    : AppState.phase == Phase.running
+                        ? (AppState.clients.length == 0 ? "Sharing \{AppState.upstream.ssid} · No devices yet"
+                            : AppState.clients.length == 1 ? "Sharing \{AppState.upstream.ssid} · 1 device"
+                            : "Sharing \{AppState.upstream.ssid} · \{AppState.clients.length} devices")
+                    : AppState.upstream.connected ? "Share the Wi-Fi from \{AppState.upstream.ssid} with other devices."
+                    : "Connect to a Wi-Fi network to share it.";
+            }
+            if AppState.phase != Phase.no-profile: HotspotCard { }
+            if AppState.phase == Phase.running: DevicesCard { }
+            if AppState.phase != Phase.no-profile: UpstreamCard { }
+            if AppState.phase != Phase.no-profile && AppState.current.portal: LinkCard {
+                text: "Coupons";
+                has-icon: true;
+                icon: @image-url("icons/tag.svg");
+                clicked => { AppState.open-coupons(); }
+            }
+            if AppState.phase != Phase.no-profile && AppState.current.portal: LinkCard {
+                text: "Users";
+                has-icon: true;
+                icon: @image-url("icons/phone.svg");
+                clicked => { AppState.open-users(); }
+            }
+            if AppState.phase != Phase.no-profile: LinkCard {
+                text: "Blocked devices";
+                value: AppState.blocked.length;
+                clicked => { AppState.open-blocked(); }
+            }
+        }
+    }
+    Footer { }
+}

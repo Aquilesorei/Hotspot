@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Hotspot
+Comment=Share Wi-Fi while staying connected to Wi-Fi
+Exec=/usr/local/bin/hotspot-ui
+Icon=hotspot
+Terminal=false
+Categories=Network;
+Keywords=wifi;hotspot;tethering;share;
+StartupWMClass=hotspot-ui

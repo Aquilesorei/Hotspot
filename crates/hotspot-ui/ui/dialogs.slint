@@ -1,0 +1,145 @@
+import { LineEdit } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { Button, ButtonKind } from "components.slint";
+import { AppState, Dialog } from "state.slint";
+
+export component ConfirmDialog inherits Rectangle {
+    background: Theme.dark ? #00000099 : #14181C73;
+    TouchArea { }
+    property <string> title: AppState.dialog == Dialog.block-all ? "Block all devices?"
+        : AppState.dialog == Dialog.restart ? "Restart the hotspot?"
+        : AppState.dialog == Dialog.delete ? "Delete “\{AppState.current.name}”?" : "Stop the hotspot?";
+    property <string> body: AppState.dialog == Dialog.block-all
+        ? (AppState.dialog-count == 1 ? "1 device will be disconnected and refused. You can unblock it later in Blocked devices."
+            : "\{AppState.dialog-count} devices will be disconnected and refused. You can unblock them later in Blocked devices.")
+        : AppState.dialog == Dialog.restart
+        ? (AppState.dialog-count == 0 ? "This restarts the hotspot."
+            : AppState.dialog-count == 1 ? "This restarts the hotspot and disconnects 1 device."
+            : "This restarts the hotspot and disconnects \{AppState.dialog-count} devices.")
+        : AppState.dialog == Dialog.delete ? "This removes the profile and its list of blocked devices."
+        : AppState.dialog-count == 1 ? "Closing this window stops the hotspot and disconnects 1 device."
+        : "Closing this window stops the hotspot and disconnects \{AppState.dialog-count} devices.";
+    property <string> confirm: AppState.dialog == Dialog.block-all ? "Block all"
+        : AppState.dialog == Dialog.restart ? "Restart and apply" : AppState.dialog == Dialog.delete ? "Delete" : "Close and stop";
+    Rectangle {
+        x: 24px;
+        y: 190px;
+        width: parent.width - 48px;
+        height: box.preferred-height;
+        background: Theme.surface;
+        border-width: 1px;
+        border-color: Theme.border;
+        border-radius: 14px;
+        box := VerticalLayout {
+            padding: 20px;
+            spacing: 12px;
+            Text {
+                text: root.title;
+                color: Theme.text;
+                font-size: Theme.title;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
+            Text {
+                text: root.body;
+                color: Theme.text-2;
+                font-size: Theme.body;
+                wrap: word-wrap;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+                Button {
+                    text: "Cancel";
+                    kind: ButtonKind.secondary;
+                    clicked => { AppState.dialog = Dialog.none; }
+                }
+                Button {
+                    text: root.confirm;
+                    kind: AppState.dialog == Dialog.restart ? ButtonKind.primary : ButtonKind.danger;
+                    clicked => { AppState.confirm-dialog(); }
+                }
+            }
+        }
+    }
+}
+
+export component InputDialog inherits Rectangle {
+    background: Theme.dark ? #00000099 : #14181C73;
+    TouchArea { }
+    property <string> title: AppState.dialog == Dialog.rename ? "Rename device"
+        : AppState.dialog == Dialog.time-limit ? "Allow for…" : "Limit speed";
+    property <string> body: AppState.dialog == Dialog.rename ? "Shown instead of the name the device reports. Leave empty to use that name again."
+        : AppState.dialog == Dialog.time-limit ? "The device is blocked when the time runs out. Ends when the hotspot stops."
+        : "Applies to download and upload.";
+    property <string> placeholder: AppState.dialog == Dialog.rename ? "Device name"
+        : AppState.dialog == Dialog.time-limit ? "Custom: minutes" : "Custom: Mbit/s";
+    Rectangle {
+        x: 24px;
+        y: 150px;
+        width: parent.width - 48px;
+        height: box.preferred-height;
+        background: Theme.surface;
+        border-width: 1px;
+        border-color: Theme.border;
+        border-radius: 14px;
+        box := VerticalLayout {
+            padding: 20px;
+            spacing: 12px;
+            Text {
+                text: root.title;
+                color: Theme.text;
+                font-size: Theme.title;
+                font-weight: 700;
+            }
+            Text {
+                text: root.body;
+                color: Theme.text-2;
+                font-size: Theme.small;
+                wrap: word-wrap;
+            }
+            if AppState.dialog-presets.length > 0: HorizontalLayout {
+                spacing: 8px;
+                for preset[i] in AppState.dialog-presets: Button {
+                    horizontal-stretch: 1;
+                    small: true;
+                    kind: ButtonKind.secondary;
+                    text: preset;
+                    clicked => { AppState.dialog-preset(i); }
+                }
+            }
+            LineEdit {
+                text <=> AppState.dialog-input;
+                placeholder-text: root.placeholder;
+                accepted => { AppState.dialog-apply(); }
+            }
+            if AppState.dialog-error != "": Text {
+                text: AppState.dialog-error;
+                color: Theme.error;
+                font-size: Theme.caption;
+                wrap: word-wrap;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                if AppState.dialog-can-remove: Button {
+                    text: "Remove limit";
+                    kind: ButtonKind.secondary-danger;
+                    small: true;
+                    clicked => { AppState.dialog-remove(); }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Button {
+                    text: "Cancel";
+                    kind: ButtonKind.secondary;
+                    small: true;
+                    clicked => { AppState.dialog = Dialog.none; }
+                }
+                Button {
+                    text: "Apply";
+                    small: true;
+                    clicked => { AppState.dialog-apply(); }
+                }
+            }
+        }
+    }
+}

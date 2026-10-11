@@ -1,0 +1,196 @@
+import { NoticeKind } from "components.slint";
+
+export enum Phase { no-profile, stopped, authorizing, starting, running, stopping }
+
+export enum Unsupported { none, no-ap-sta, no-upstream }
+
+export enum Sheet { none, profile-new, profile-edit, blocked, coupons, users, settings }
+
+export enum Dialog { none, restart, delete, close, block-all, rename, time-limit, speed-limit }
+
+export struct Profile {
+    name: string,
+    ssid: string,
+    password: string,
+    hidden: bool,
+    max-clients: string,
+    portal: bool,
+}
+
+export struct Upstream {
+    connected: bool,
+    ssid: string,
+    iface: string,
+    channel: int,
+    freq-mhz: int,
+    band: string,
+}
+
+export struct Client {
+    mac: string,
+    ip: string,
+    hostname: string,
+    connected: string,
+    internet-cut: bool,
+    blocked: bool,
+    usage: string,
+    expires: string,
+    speed: string,
+    // captive portal session, if any
+    portal-name: string,
+    portal-phone: string,
+    portal-left: string,
+}
+
+export struct UserRow {
+    name: string,
+    phone: string,
+    coupon: string,
+    mac: string,
+    ip: string,
+    status: string,
+    // 0 active, 1 expired, 2 signed out, 3 ended
+    status-kind: int,
+    online: bool,
+    left: string,
+    first: string,
+    last: string,
+    history: [string],
+}
+
+export struct CouponRow {
+    code: string,
+    duration: string,
+    mode: string,
+    state: string,
+    // 0 new, 1 in use, 2 used up, 3 revoked
+    state-kind: int,
+    left: string,
+    devices: string,
+}
+
+export struct BlockedDevice {
+    mac: string,
+    name: string,
+}
+
+export struct Notice {
+    id: string,
+    kind: NoticeKind,
+    title: string,
+    body: string,
+    dismissible: bool,
+    details: string,
+}
+
+export global AppState {
+    in-out property <[Profile]> profiles;
+    in-out property <[string]> profile-labels: ["No profile"];
+    in-out property <int> selected: -1;
+    in-out property <Phase> phase: no-profile;
+    in-out property <Unsupported> unsupported: none;
+    in-out property <Upstream> upstream;
+    in-out property <[Notice]> notices;
+    in-out property <bool> password-revealed;
+    in-out property <bool> copied;
+    in-out property <[BlockedDevice]> blocked;
+    in-out property <string> running-profile;
+    /// Connected to the background service: no password, and the hotspot outlives the window.
+    in-out property <bool> service;
+    /// A system tray is available: closing the window only hides it.
+    in-out property <bool> tray;
+
+    in-out property <[Client]> clients;
+    in-out property <bool> internet-cut-all;
+    in-out property <bool> qr-shown;
+    in-out property <image> qr-image;
+
+    in-out property <Sheet> sheet: none;
+    in-out property <Dialog> dialog: none;
+    in-out property <int> dialog-count;
+
+    in-out property <string> form-name;
+    in-out property <string> form-ssid;
+    in-out property <string> form-password;
+    in-out property <bool> form-password-revealed;
+    in-out property <string> form-name-error;
+    in-out property <string> form-ssid-error;
+    in-out property <string> form-password-error;
+    in-out property <int> form-ssid-bytes;
+    in-out property <bool> form-attempted;
+    in-out property <bool> form-hidden;
+    in-out property <string> form-max;
+    in-out property <string> form-max-error;
+
+    // input dialogs (rename, time limit, speed limit)
+    in-out property <string> dialog-mac;
+    in-out property <string> dialog-input;
+    in-out property <string> dialog-error;
+    in-out property <[string]> dialog-presets;
+    in-out property <bool> dialog-can-remove;
+
+    out property <Profile> current: selected >= 0 && selected < profiles.length ? profiles[selected] : { name: "", ssid: "", password: "", hidden: false, max-clients: "", portal: false };
+    out property <bool> idle: phase == Phase.stopped || phase == Phase.no-profile;
+    out property <bool> busy: phase == Phase.authorizing || phase == Phase.starting;
+    out property <bool> can-start: phase == Phase.stopped && unsupported == Unsupported.none && upstream.connected
+        && (!current.portal || service);
+    out property <bool> form-valid: form-name-error == "" && form-ssid-error == "" && form-password-error == "" && form-max-error == ""
+        && (!form-portal || form-portal-error == "");
+    out property <bool> editing-running: sheet == Sheet.profile-edit && phase == Phase.running && current.name == running-profile;
+
+    callback select-profile(int);
+    callback start();
+    callback stop();
+    callback new-profile();
+    callback edit-profile();
+    callback open-blocked();
+    callback close-sheet();
+    callback copy-password();
+    callback dismiss-notice(string);
+    callback toggle-qr();
+    callback set-cut-all(bool);
+    callback set-client-cut(string, bool);
+    callback block(string);
+    callback unblock(string);
+    callback unblock-all();
+
+    // captive portal
+    in-out property <bool> form-portal;
+    in-out property <[string]> country-labels;
+    in-out property <int> form-country;
+    in-out property <bool> form-connected;
+    in-out property <string> form-devices: "1";
+    in-out property <string> form-portal-error;
+    in-out property <[CouponRow]> coupons;
+    in-out property <[UserRow]> users;
+    in-out property <string> users-filter;
+    in-out property <string> form-durations;
+    in-out property <bool> notifications: true;
+    in-out property <bool> autostart;
+    in-out property <[string]> coupon-durations;
+    in-out property <string> cf-count: "10";
+    in-out property <int> cf-duration: 3;
+    in-out property <string> cf-custom;
+    in-out property <bool> cf-connected;
+    in-out property <string> cf-devices: "1";
+    in-out property <string> cf-error;
+    callback open-coupons();
+    callback open-users();
+    callback filter-users();
+    callback export-users();
+    callback set-notifications(bool);
+    callback set-autostart(bool);
+    callback create-coupons();
+    callback coupon-action(string, string);
+    callback export-coupons();
+    callback end-session(string);
+    callback form-changed();
+    callback save-profile();
+    callback delete-profile();
+    callback confirm-dialog();
+    callback generate-password();
+    callback open-dialog(Dialog, string);
+    callback dialog-preset(int);
+    callback dialog-apply();
+    callback dialog-remove();
+}

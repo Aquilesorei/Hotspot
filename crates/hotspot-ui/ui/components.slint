@@ -1,3 +1,4 @@
+import { LineEdit } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 
 export enum ButtonKind { primary, danger, secondary, secondary-danger }
@@ -317,3 +318,95 @@ export component LinkCard inherits Rectangle {
         }
     }
 }
+
+export component PopupItem inherits Rectangle {
+    in property <string> text;
+    in property <image> icon;
+    in property <bool> danger: false;
+    in property <bool> enabled: true;
+    callback clicked();
+    height: 40px;
+    border-radius: 6px;
+    background: enabled && ta.has-hover ? (danger ? Theme.error-soft : Theme.surface-2) : transparent;
+    property <color> fg: !enabled ? Theme.disabled-text : danger ? Theme.error : Theme.text;
+    accessible-role: button;
+    accessible-label: text;
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 8px;
+        Icon {
+            source: root.icon;
+            tint: root.fg;
+            y: (parent.height - self.height) / 2;
+        }
+        Text {
+            text: root.text;
+            color: root.fg;
+            font-size: Theme.small;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component FormField inherits VerticalLayout {
+    in property <string> label;
+    in property <string> hint;
+    in property <string> counter;
+    in property <string> error;
+    in property <bool> password: false;
+    in property <bool> revealed: false;
+    in property <bool> enabled: true;
+    in property <bool> can-generate: false;
+    in-out property <string> text;
+    callback edited();
+    callback toggle-reveal();
+    callback generate();
+    spacing: 6px;
+    Text {
+        text: root.label;
+        color: Theme.text;
+        font-size: Theme.small;
+        font-weight: 600;
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        LineEdit {
+            text <=> root.text;
+            enabled: root.enabled;
+            input-type: root.password && !root.revealed ? InputType.password : InputType.text;
+            edited => { root.edited(); }
+        }
+        if root.password: IconButton {
+            icon: root.revealed ? @image-url("icons/eye-off.svg") : @image-url("icons/eye.svg");
+            label: root.revealed ? "Hide password" : "Show password";
+            clicked => { root.toggle-reveal(); }
+        }
+        if root.can-generate: IconButton {
+            icon: @image-url("icons/dice.svg");
+            label: "Generate a password";
+            clicked => { root.generate(); }
+        }
+    }
+    HorizontalLayout {
+        Text {
+            text: root.error != "" ? root.error : root.hint;
+            color: root.error != "" ? Theme.error : Theme.text-2;
+            font-size: Theme.caption;
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.counter;
+            color: Theme.text-2;
+            font-size: Theme.caption;
+        }
+    }
+}
+
