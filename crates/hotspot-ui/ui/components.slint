@@ -267,3 +267,53 @@ export component LabeledValue inherits VerticalLayout {
         font-family: root.mono ? Theme.mono : "";
     }
 }
+
+/// A whole-card button that opens a sheet. The touch area covers the card: inside a `Card`,
+/// it would be laid out as one more row of zero height.
+export component LinkCard inherits Rectangle {
+    in property <string> text;
+    in property <string> value;
+    in property <image> icon;
+    in property <bool> has-icon: false;
+    callback clicked();
+    min-height: 56px;
+    background: ta.has-hover ? Theme.surface-2 : Theme.surface;
+    border-width: 1px;
+    border-color: Theme.border;
+    border-radius: 12px;
+    accessible-role: button;
+    accessible-label: text;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        spacing: 8px;
+        if root.has-icon: Icon {
+            source: root.icon;
+            tint: Theme.text-2;
+            y: (parent.height - self.height) / 2;
+        }
+        Text {
+            text: root.text;
+            color: Theme.text;
+            font-size: Theme.body;
+            font-weight: 600;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.value;
+            color: Theme.text-2;
+            font-size: Theme.body;
+            vertical-alignment: center;
+        }
+        Icon {
+            source: @image-url("icons/chevron-right.svg");
+            tint: Theme.text-2;
+            y: (parent.height - self.height) / 2;
+        }
+    }
+}

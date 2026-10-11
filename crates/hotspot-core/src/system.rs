@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
+use std::net::SocketAddr;
+use std::sync::mpsc::Sender;
 use std::path::Path;
 use std::process::{Child, Stdio};
 use std::thread::sleep;
@@ -9,8 +11,9 @@ use crate::network_backend::NetworkBackend;
 use crate::error::{HotspotError, Result};
 use crate::models::{DnsmasqArgs, PhyCaps, UplinkInfo, WifiAdapter};
 use crate::parse;
-use crate::constants::{
-    bin, AP_IFACE, CUT_IFACES_SET, CUT_MACS_SET, USAGE_DOWN_SET, USAGE_UP_SET, DHCP_LEASE, FWD_CHAIN, INPUT_CHAIN, IP_FORWARD, KILL_POLL, KILL_TIMEOUT, NAT_TABLE,
+use crate::portal_http::{PageInfo, PortalRequest, PortalServer};
+use crate::constants::{PORTAL_HOSTNAME, 
+    bin, AP_IFACE, ARP_TABLE, CUT_IFACES_SET, CUT_MACS_SET, PORTAL_ALLOWED_SET, PORTAL_CHAIN, USAGE_DOWN_SET, USAGE_UP_SET, DHCP_LEASE, FWD_CHAIN, INPUT_CHAIN, IP_FORWARD, KILL_POLL, KILL_TIMEOUT, NAT_TABLE,
     NM_UNMANAGED_CONF_PATH,
 };
 use crate::runner::{command, run, run_ok, run_unit, succeeds};
@@ -183,6 +186,36 @@ impl NetworkBackend for SystemBackend {
         nft_set_element(CUT_MACS_SET, mac, cut)
     }
 
+    fn nft_install_portal(&self, ap: &str, gateway: &str, port: u16) -> Result<()> {
+        let allowed = format!("@{PORTAL_ALLOWED_SET}");
+        let target = format!("{gateway}:{port}");
+        let port = port.to_string();
+        let steps: [&[&str]; 6] = [
+            &["add", "set", "ip", NAT_TABLE, PORTAL_ALLOWED_SET, "{ type ether_addr; }"],
+            &["add", "chain", "ip", NAT_TABLE, PORTAL_CHAIN, "{ type nat hook prerouting priority dstnat; }"],
+            // http://<gateway>/ shows signed-in devices their time left
+            &["add", "rule", "ip", NAT_TABLE, PORTAL_CHAIN, "iifname", ap, "ip", "daddr", gateway, "tcp", "dport", "80", "dnat", "to", &target],
+            &["add", "rule", "ip", NAT_TABLE, PORTAL_CHAIN, "iifname", ap, "ether", "saddr", "!=", &allowed, "tcp", "dport", "80",
+                "dnat", "to", &target],
+            &["add", "rule", "ip", NAT_TABLE, FWD_CHAIN, "iifname", ap, "ether", "saddr", "!=", &allowed, "drop"],
+            // insert, not add: host_input ends with a drop for everything else from ap0
+            &["insert", "rule", "ip", NAT_TABLE, INPUT_CHAIN, "iifname", ap, "tcp", "dport", &port, "accept"],
+        ];
+        steps.iter().try_for_each(|args| fw_run(bin::NFT, args))
+    }
+
+    fn nft_portal_allow(&self, mac: &str, allow: bool) -> Result<()> {
+        nft_set_element(PORTAL_ALLOWED_SET, mac, allow)
+    }
+
+    fn serve_portal(&self, addr: SocketAddr, page: PageInfo, requests: Sender<PortalRequest>) -> Result<Option<PortalServer>> {
+        Ok(Some(PortalServer::start(addr, page, requests)?))
+    }
+
+    fn mac_of(&self, ap: &str, ip: &str) -> Option<String> {
+        parse::arp_mac(&fs::read_to_string(ARP_TABLE).ok()?, ap, ip)
+    }
+
     fn nft_nat_present(&self) -> bool {
         succeeds(bin::NFT, &["list", "table", "ip", NAT_TABLE])
     }
@@ -270,6 +303,7 @@ impl NetworkBackend for SystemBackend {
             "--log-dhcp".into(),
         ];
         args.extend(a.upstream_dns.iter().map(|d| format!("--server={d}")));
+        args.extend(a.portal_gateway.map(|g| format!("--address=/{PORTAL_HOSTNAME}/{g}")));
         spawn(bin::DNSMASQ, &args)
     }
 

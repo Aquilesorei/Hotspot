@@ -103,6 +103,14 @@ pub fn nft_set_counters(json: &str) -> HashMap<String, u64> {
         .collect()
 }
 
+/// `/proc/net/arp` -> MAC of `ip` on `iface` (`IP address  HW type  Flags  HW address  Mask  Device`).
+pub fn arp_mac(table: &str, iface: &str, ip: &str) -> Option<String> {
+    table.lines().skip(1).find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        (f.len() >= 6 && f[0] == ip && f[5] == iface && f[3] != "00:00:00:00:00:00").then(|| f[3].to_lowercase())
+    })
+}
+
 fn between<'a>(s: &'a str, start: &str, end: &str) -> Option<&'a str> {
     let i = s.find(start)? + start.len();
     let j = s[i..].find(end)? + i;
@@ -181,6 +189,18 @@ Wiphy phy0
         // 6 GHz channel 1 (disabled) must not affect 2.4 GHz channel 1
         assert_eq!(class(5955), ChannelClass::Disabled);
         assert_eq!(chans.iter().filter(|c| c.number == 1).count(), 2);
+    }
+
+    #[test]
+    fn arp_lookup() {
+        let table = "IP address       HW type     Flags       HW address            Mask     Device
+192.168.12.100   0x1         0x2         12:5A:7A:56:8A:D6     *        ap0
+192.168.12.101   0x1         0x0         00:00:00:00:00:00     *        ap0
+10.0.0.1         0x1         0x2         aa:bb:cc:dd:ee:ff     *        wlo1
+";
+        assert_eq!(arp_mac(table, "ap0", "192.168.12.100").as_deref(), Some("12:5a:7a:56:8a:d6"));
+        assert_eq!(arp_mac(table, "ap0", "192.168.12.101"), None);
+        assert_eq!(arp_mac(table, "ap0", "10.0.0.1"), None);
     }
 
     #[test]

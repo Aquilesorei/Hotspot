@@ -1,12 +1,12 @@
 import { CheckBox, ComboBox, LineEdit, ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { Banner, Button, ButtonKind, Card, Chip, Divider, Icon, IconButton, LabeledValue, NoticeKind, Row, StatusCard, StatusKind } from "components.slint";
+import { Banner, Button, LinkCard, ButtonKind, Card, Chip, Divider, Icon, IconButton, LabeledValue, NoticeKind, Row, StatusCard, StatusKind } from "components.slint";
 
 export { NoticeKind }
 
 export enum Phase { no-profile, stopped, authorizing, starting, running, stopping }
 export enum Unsupported { none, no-ap-sta, no-upstream }
-export enum Sheet { none, profile-new, profile-edit, blocked }
+export enum Sheet { none, profile-new, profile-edit, blocked, coupons, users, settings }
 export enum Dialog { none, restart, delete, close, block-all, rename, time-limit, speed-limit }
 
 export struct Profile {
@@ -15,6 +15,7 @@ export struct Profile {
     password: string,
     hidden: bool,
     max-clients: string,
+    portal: bool,
 }
 
 export struct Upstream {
@@ -36,6 +37,37 @@ export struct Client {
     usage: string,
     expires: string,
     speed: string,
+    // captive portal session, if any
+    portal-name: string,
+    portal-phone: string,
+    portal-left: string,
+}
+
+export struct UserRow {
+    name: string,
+    phone: string,
+    coupon: string,
+    mac: string,
+    ip: string,
+    status: string,
+    // 0 active, 1 expired, 2 signed out, 3 ended
+    status-kind: int,
+    online: bool,
+    left: string,
+    first: string,
+    last: string,
+    history: [string],
+}
+
+export struct CouponRow {
+    code: string,
+    duration: string,
+    mode: string,
+    state: string,
+    // 0 new, 1 in use, 2 used up, 3 revoked
+    state-kind: int,
+    left: string,
+    devices: string,
 }
 
 export struct BlockedDevice {
@@ -98,11 +130,13 @@ export global AppState {
     in-out property <[string]> dialog-presets;
     in-out property <bool> dialog-can-remove;
 
-    out property <Profile> current: selected >= 0 && selected < profiles.length ? profiles[selected] : { name: "", ssid: "", password: "", hidden: false, max-clients: "" };
+    out property <Profile> current: selected >= 0 && selected < profiles.length ? profiles[selected] : { name: "", ssid: "", password: "", hidden: false, max-clients: "", portal: false };
     out property <bool> idle: phase == Phase.stopped || phase == Phase.no-profile;
     out property <bool> busy: phase == Phase.authorizing || phase == Phase.starting;
-    out property <bool> can-start: phase == Phase.stopped && unsupported == Unsupported.none && upstream.connected;
-    out property <bool> form-valid: form-name-error == "" && form-ssid-error == "" && form-password-error == "" && form-max-error == "";
+    out property <bool> can-start: phase == Phase.stopped && unsupported == Unsupported.none && upstream.connected
+        && (!current.portal || service);
+    out property <bool> form-valid: form-name-error == "" && form-ssid-error == "" && form-password-error == "" && form-max-error == ""
+        && (!form-portal || form-portal-error == "");
     out property <bool> editing-running: sheet == Sheet.profile-edit && phase == Phase.running && current.name == running-profile;
 
     callback select-profile(int);
@@ -120,6 +154,37 @@ export global AppState {
     callback block(string);
     callback unblock(string);
     callback unblock-all();
+
+    // captive portal
+    in-out property <bool> form-portal;
+    in-out property <[string]> country-labels;
+    in-out property <int> form-country;
+    in-out property <bool> form-connected;
+    in-out property <string> form-devices: "1";
+    in-out property <string> form-portal-error;
+    in-out property <[CouponRow]> coupons;
+    in-out property <[UserRow]> users;
+    in-out property <string> users-filter;
+    in-out property <string> form-durations;
+    in-out property <bool> notifications: true;
+    in-out property <bool> autostart;
+    in-out property <[string]> coupon-durations;
+    in-out property <string> cf-count: "10";
+    in-out property <int> cf-duration: 3;
+    in-out property <string> cf-custom;
+    in-out property <bool> cf-connected;
+    in-out property <string> cf-devices: "1";
+    in-out property <string> cf-error;
+    callback open-coupons();
+    callback open-users();
+    callback filter-users();
+    callback export-users();
+    callback set-notifications(bool);
+    callback set-autostart(bool);
+    callback create-coupons();
+    callback coupon-action(string, string);
+    callback export-coupons();
+    callback end-session(string);
     callback form-changed();
     callback save-profile();
     callback delete-profile();
@@ -201,6 +266,11 @@ component Header inherits Rectangle {
             enabled: !AppState.busy && AppState.phase != Phase.stopping;
             clicked => { AppState.new-profile(); }
         }
+        IconButton {
+            icon: @image-url("icons/settings.svg");
+            label: "Settings";
+            clicked => { AppState.sheet = Sheet.settings; }
+        }
     }
     Divider {
         y: parent.height - 1px;
@@ -243,7 +313,13 @@ component HotspotCard inherits Card {
         }
     }
     Divider { }
-    Row {
+    if AppState.current.portal: Row {
+        LabeledValue {
+            label: "Access";
+            value: "Open network · coupon required";
+        }
+    }
+    if !AppState.current.portal: Row {
         LabeledValue {
             label: "Password";
             value: AppState.password-revealed ? AppState.current.password : "••••••••••";
@@ -360,10 +436,21 @@ component ClientRow inherits Rectangle {
             horizontal-stretch: 1;
             spacing: 2px;
             Text {
-                text: root.client.hostname != "" ? root.client.hostname : "Unknown device";
-                color: root.client.hostname != "" ? Theme.text : Theme.text-2;
+                text: root.client.portal-name != "" ? root.client.portal-name
+                    : root.client.hostname != "" ? root.client.hostname : "Unknown device";
+                color: root.client.hostname != "" || root.client.portal-name != "" ? Theme.text : Theme.text-2;
                 font-size: Theme.body;
-                font-weight: root.client.hostname != "" ? 700 : 600;
+                font-weight: root.client.hostname != "" || root.client.portal-name != "" ? 700 : 600;
+            }
+            if root.client.portal-phone != "": Text {
+                text: root.client.portal-phone;
+                color: Theme.text-2;
+                font-size: Theme.caption;
+            }
+            if root.client.portal-name == "" && AppState.current.portal: Text {
+                text: "Not signed in yet";
+                color: Theme.warn;
+                font-size: Theme.caption;
             }
             if root.client.ip != "": Text {
                 text: root.client.ip;
@@ -387,9 +474,14 @@ component ClientRow inherits Rectangle {
                 color: Theme.text-2;
                 font-size: Theme.caption;
             }
-            if root.client.expires != "" || root.client.speed != "": HorizontalLayout {
+            if root.client.expires != "" || root.client.speed != "" || root.client.portal-left != "": HorizontalLayout {
                 padding-top: 4px;
                 spacing: 6px;
+                if root.client.portal-left != "": Chip {
+                    text: root.client.portal-left;
+                    has-icon: true;
+                    icon: @image-url("icons/clock.svg");
+                }
                 if root.client.expires != "": Chip {
                     text: root.client.expires;
                     has-icon: true;
@@ -460,6 +552,11 @@ component ClientRow inherits Rectangle {
                     text: "Limit speed…";
                     icon: @image-url("icons/gauge.svg");
                     clicked => { AppState.open-dialog(Dialog.speed-limit, root.client.mac); }
+                }
+                if root.client.portal-name != "": PopupItem {
+                    text: "End portal session";
+                    icon: @image-url("icons/x.svg");
+                    clicked => { AppState.end-session(root.client.mac); }
                 }
                 if !root.client.blocked: PopupItem {
                     text: "Block device";
@@ -623,33 +720,385 @@ component UpstreamCard inherits Card {
     }
 }
 
-component BlockedLink inherits Card {
-    Row {
-        Text {
-            text: "Blocked devices";
-            color: Theme.text;
-            font-size: Theme.body;
-            font-weight: 600;
-            vertical-alignment: center;
+
+component CouponRowView inherits Rectangle {
+    in property <CouponRow> coupon;
+    min-height: row.preferred-height;
+    row := HorizontalLayout {
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 12px;
+        VerticalLayout {
             horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: root.coupon.code;
+                color: root.coupon.state-kind >= 2 ? Theme.text-2 : Theme.text;
+                font-family: Theme.mono;
+                font-size: Theme.title;
+                font-weight: 700;
+            }
+            Text {
+                text: "\{root.coupon.duration} · \{root.coupon.mode} · \{root.coupon.devices}";
+                color: Theme.text-2;
+                font-size: Theme.caption;
+            }
+            if root.coupon.left != "": Text {
+                text: root.coupon.left;
+                color: Theme.text-2;
+                font-size: Theme.caption;
+            }
         }
-        Text {
-            text: AppState.blocked.length;
-            color: Theme.text-2;
-            font-size: Theme.body;
-            vertical-alignment: center;
-        }
-        Icon {
-            source: @image-url("icons/chevron-right.svg");
-            tint: Theme.text-2;
+        Chip {
+            text: root.coupon.state;
+            neutral: root.coupon.state-kind == 0;
+            kind: root.coupon.state-kind == 1 ? NoticeKind.info : root.coupon.state-kind == 3 ? NoticeKind.error : NoticeKind.warn;
             y: (parent.height - self.height) / 2;
         }
+        VerticalLayout {
+            alignment: center;
+            more := IconButton {
+                icon: @image-url("icons/more.svg");
+                label: "Coupon actions";
+                clicked => { menu.show(); }
+            }
+        }
     }
-    TouchArea {
-        mouse-cursor: pointer;
-        clicked => { AppState.open-blocked(); }
+    menu := PopupWindow {
+        x: root.width - 200px;
+        y: root.height - 4px;
+        width: 200px;
+        Rectangle {
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border-control;
+            border-radius: 8px;
+            VerticalLayout {
+                padding: 4px;
+                PopupItem {
+                    text: "Copy code";
+                    icon: @image-url("icons/copy.svg");
+                    clicked => { AppState.coupon-action(root.coupon.code, "copy"); }
+                }
+                PopupItem {
+                    text: "Add 1 hour";
+                    icon: @image-url("icons/clock.svg");
+                    enabled: root.coupon.state-kind != 3;
+                    clicked => { AppState.coupon-action(root.coupon.code, "extend"); }
+                }
+                PopupItem {
+                    text: "Revoke";
+                    icon: @image-url("icons/ban.svg");
+                    danger: true;
+                    enabled: root.coupon.state-kind != 3;
+                    clicked => { AppState.coupon-action(root.coupon.code, "revoke"); }
+                }
+            }
+        }
     }
 }
+
+component SettingsSheet inherits VerticalLayout {
+    SheetHeader {
+        back: true;
+        title: "Settings";
+    }
+    ScrollView {
+        content-width: self.visible-width;
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+            alignment: start;
+            Card {
+                pad-v: 12px;
+                VerticalLayout {
+                    spacing: 4px;
+                    CheckBox {
+                        text: "Notifications";
+                        checked <=> AppState.notifications;
+                        toggled => { AppState.set-notifications(self.checked); }
+                    }
+                    Text {
+                        text: "New devices, wrong passwords, portal sign-ins and ended guest access.";
+                        color: Theme.text-2;
+                        font-size: Theme.caption;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+            Card {
+                pad-v: 12px;
+                VerticalLayout {
+                    spacing: 4px;
+                    CheckBox {
+                        text: "Start at login";
+                        checked <=> AppState.autostart;
+                        toggled => { AppState.set-autostart(self.checked); }
+                    }
+                    Text {
+                        text: "Only the tray icon appears; click it to open this window.";
+                        color: Theme.text-2;
+                        font-size: Theme.caption;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+    }
+}
+
+component UserRowView inherits Rectangle {
+    in property <UserRow> user;
+    property <bool> open;
+    min-height: col.preferred-height;
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.open = !root.open; }
+    }
+    col := VerticalLayout {
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 2px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: root.user.name;
+                color: root.user.status-kind == 0 ? Theme.text : Theme.text-2;
+                font-size: Theme.body;
+                font-weight: 600;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            Chip {
+                text: root.user.status;
+                neutral: root.user.status-kind == 3;
+                kind: root.user.status-kind == 0 ? NoticeKind.info : root.user.status-kind == 2 ? NoticeKind.error : NoticeKind.warn;
+            }
+        }
+        Text {
+            text: "\{root.user.phone} · coupon \{root.user.coupon}";
+            color: Theme.text-2;
+            font-size: Theme.caption;
+        }
+        Text {
+            text: root.user.left != "" ? "\{root.user.left} · last seen \{root.user.last}" : "Last seen \{root.user.last}";
+            color: Theme.text-2;
+            font-size: Theme.caption;
+        }
+        if root.open: VerticalLayout {
+            padding-top: 8px;
+            spacing: 2px;
+            Text {
+                text: "MAC \{root.user.mac}" + (root.user.ip != "" ? " · IP \{root.user.ip}" : "");
+                color: Theme.text-2;
+                font-family: Theme.mono;
+                font-size: Theme.caption;
+            }
+            Text {
+                text: "First sign-in \{root.user.first}";
+                color: Theme.text-2;
+                font-size: Theme.caption;
+            }
+            Text {
+                text: "History";
+                color: Theme.text;
+                font-size: Theme.small;
+                font-weight: 600;
+            }
+            for line in root.user.history: Text {
+                text: line;
+                color: Theme.text-2;
+                font-size: Theme.caption;
+            }
+            if root.user.status-kind == 0 && AppState.current.name == AppState.running-profile: HorizontalLayout {
+                alignment: start;
+                padding-top: 6px;
+                Button {
+                    text: "End session";
+                    kind: ButtonKind.secondary;
+                    small: true;
+                    clicked => { AppState.end-session(root.user.mac); }
+                }
+            }
+        }
+    }
+}
+
+component UsersSheet inherits VerticalLayout {
+    SheetHeader {
+        back: true;
+        title: "Users";
+        subtitle: "Profile: \{AppState.current.name}";
+    }
+    ScrollView {
+        // no sideways scrolling: content wraps or shrinks to the window
+        content-width: self.visible-width;
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+            alignment: start;
+            if !AppState.service: Banner {
+                kind: NoticeKind.warn;
+                title: "Users need the background service";
+                body: "Run ./install.sh --service, then log out and back in once.";
+                dismissible: false;
+            }
+            LineEdit {
+                text <=> AppState.users-filter;
+                placeholder-text: "Search name, phone, coupon, MAC or IP";
+                edited => { AppState.filter-users(); }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: AppState.users.length == 0 ? (AppState.users-filter == "" ? "No one has signed in yet." : "No match.")
+                        : "\{AppState.users.length} sign-ins · tap one for details. Kept 30 days after they end.";
+                    color: Theme.text-2;
+                    font-size: Theme.small;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Button {
+                    text: "Export CSV";
+                    kind: ButtonKind.secondary;
+                    small: true;
+                    enabled: AppState.users.length > 0;
+                    clicked => { AppState.export-users(); }
+                }
+            }
+            if AppState.users.length > 0: Card {
+                for user[i] in AppState.users: VerticalLayout {
+                    if i > 0: Divider { }
+                    UserRowView {
+                        user: user;
+                    }
+                }
+            }
+        }
+    }
+}
+
+component CouponsSheet inherits VerticalLayout {
+    SheetHeader {
+        back: true;
+        title: "Coupons";
+        subtitle: "Profile: \{AppState.current.name}";
+    }
+    ScrollView {
+        // no sideways scrolling: content wraps or shrinks to the window
+        content-width: self.visible-width;
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+            alignment: start;
+            if !AppState.service: Banner {
+                kind: NoticeKind.warn;
+                title: "Coupons need the background service";
+                body: "Run ./install.sh --service, then log out and back in once.";
+                dismissible: false;
+            }
+            Card {
+                pad-v: 16px;
+                VerticalLayout {
+                    spacing: 10px;
+                    Text {
+                        text: "Create coupons";
+                        color: Theme.text;
+                        font-size: Theme.title;
+                        font-weight: 700;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout {
+                            spacing: 4px;
+                            Text {
+                                text: "How many";
+                                color: Theme.text-2;
+                                font-size: Theme.caption;
+                            }
+                            LineEdit {
+                                text <=> AppState.cf-count;
+                                input-type: InputType.number;
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 4px;
+                            Text {
+                                text: "Duration";
+                                color: Theme.text-2;
+                                font-size: Theme.caption;
+                            }
+                            ComboBox {
+                                model: AppState.coupon-durations;
+                                current-index <=> AppState.cf-duration;
+                            }
+                        }
+                    }
+                    if AppState.cf-duration == AppState.coupon-durations.length - 1: LineEdit {
+                        text <=> AppState.cf-custom;
+                        placeholder-text: "Custom duration in minutes";
+                        input-type: InputType.number;
+                    }
+                    VerticalLayout {
+                        spacing: 4px;
+                        Text {
+                            text: "Devices per coupon";
+                            color: Theme.text-2;
+                            font-size: Theme.caption;
+                        }
+                        LineEdit {
+                            text <=> AppState.cf-devices;
+                            input-type: InputType.number;
+                        }
+                    }
+                    CheckBox {
+                        text: "Count only connected time";
+                        checked <=> AppState.cf-connected;
+                    }
+                    if AppState.cf-error != "": Text {
+                        text: AppState.cf-error;
+                        color: Theme.error;
+                        font-size: Theme.caption;
+                        wrap: word-wrap;
+                    }
+                    Button {
+                        text: "Create";
+                        enabled: AppState.service;
+                        clicked => { AppState.create-coupons(); }
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: "\{AppState.coupons.length} coupons";
+                    color: Theme.text-2;
+                    font-size: Theme.small;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Button {
+                    text: "Export CSV";
+                    kind: ButtonKind.secondary;
+                    small: true;
+                    enabled: AppState.coupons.length > 0;
+                    clicked => { AppState.export-coupons(); }
+                }
+            }
+            if AppState.coupons.length > 0: Card {
+                for coupon[i] in AppState.coupons: VerticalLayout {
+                    if i > 0: Divider { }
+                    CouponRowView {
+                        coupon: coupon;
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 component Footer inherits Rectangle {
     background: Theme.surface;
@@ -666,7 +1115,9 @@ component Footer inherits Rectangle {
             : AppState.phase == Phase.running && AppState.service ? "The hotspot keeps running when you close this window."
             : AppState.phase == Phase.running && AppState.tray ? "Closing this window keeps the hotspot in the tray. Quit from the tray icon stops it."
             : AppState.phase == Phase.running ? "Closing this window stops the hotspot."
-            : AppState.phase == Phase.stopped && !AppState.upstream.connected ? "Connect to a Wi-Fi network to start." : "";
+            : AppState.phase == Phase.stopped && !AppState.upstream.connected ? "Connect to a Wi-Fi network to start."
+            : AppState.phase == Phase.stopped && AppState.current.portal && !AppState.service
+                ? "Portal profiles need the background service: run ./install.sh --service." : "";
         if caption != "": Text {
             text: caption;
             color: Theme.text-2;
@@ -690,6 +1141,8 @@ component Footer inherits Rectangle {
 component MainView inherits VerticalLayout {
     Header { }
     ScrollView {
+        // no sideways scrolling: content wraps or shrinks to the window
+        content-width: self.visible-width;
         VerticalLayout {
             padding: 16px;
             spacing: 12px;
@@ -726,7 +1179,23 @@ component MainView inherits VerticalLayout {
             if AppState.phase != Phase.no-profile: HotspotCard { }
             if AppState.phase == Phase.running: DevicesCard { }
             if AppState.phase != Phase.no-profile: UpstreamCard { }
-            if AppState.phase != Phase.no-profile: BlockedLink { }
+            if AppState.phase != Phase.no-profile && AppState.current.portal: LinkCard {
+                text: "Coupons";
+                has-icon: true;
+                icon: @image-url("icons/tag.svg");
+                clicked => { AppState.open-coupons(); }
+            }
+            if AppState.phase != Phase.no-profile && AppState.current.portal: LinkCard {
+                text: "Users";
+                has-icon: true;
+                icon: @image-url("icons/phone.svg");
+                clicked => { AppState.open-users(); }
+            }
+            if AppState.phase != Phase.no-profile: LinkCard {
+                text: "Blocked devices";
+                value: AppState.blocked.length;
+                clicked => { AppState.open-blocked(); }
+            }
         }
     }
     Footer { }
@@ -792,6 +1261,8 @@ component ProfileSheet inherits VerticalLayout {
         title: AppState.sheet == Sheet.profile-new ? "New profile" : "Edit profile";
     }
     ScrollView {
+        // no sideways scrolling: content wraps or shrinks to the window
+        content-width: self.visible-width;
         VerticalLayout {
             padding: 16px;
             spacing: 16px;
@@ -804,8 +1275,9 @@ component ProfileSheet inherits VerticalLayout {
             }
             FormField {
                 label: "Profile name";
-                enabled: !AppState.editing-running;
-                hint: AppState.editing-running ? "Stop the hotspot to rename this profile." : "";
+                enabled: !AppState.editing-running && !(AppState.sheet == Sheet.profile-edit && AppState.form-portal);
+                hint: AppState.sheet == Sheet.profile-edit && AppState.form-portal ? "Portal profiles keep their coupons under this name, so it can't change."
+                    : AppState.editing-running ? "Stop the hotspot to rename this profile." : "";
                 text <=> AppState.form-name;
                 error: AppState.form-attempted ? AppState.form-name-error : "";
                 edited => { AppState.form-changed(); }
@@ -818,7 +1290,87 @@ component ProfileSheet inherits VerticalLayout {
                 error: AppState.form-attempted ? AppState.form-ssid-error : "";
                 edited => { AppState.form-changed(); }
             }
-            FormField {
+            if AppState.sheet == Sheet.profile-new: VerticalLayout {
+                spacing: 6px;
+                Text {
+                    text: "Profile type";
+                    color: Theme.text;
+                    font-size: Theme.small;
+                    font-weight: 600;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button {
+                        horizontal-stretch: 1;
+                        small: true;
+                        text: "Password";
+                        kind: AppState.form-portal ? ButtonKind.secondary : ButtonKind.primary;
+                        clicked => {
+                            AppState.form-portal = false;
+                            AppState.form-changed();
+                        }
+                    }
+                    Button {
+                        horizontal-stretch: 1;
+                        small: true;
+                        text: "Portal with coupons";
+                        kind: AppState.form-portal ? ButtonKind.primary : ButtonKind.secondary;
+                        clicked => {
+                            AppState.form-portal = true;
+                            AppState.form-changed();
+                        }
+                    }
+                }
+                Text {
+                    text: AppState.form-portal
+                        ? "Open Wi-Fi: devices get internet after entering their details and a coupon code. Can't be changed later."
+                        : "Devices join with a password. Can't be changed into a portal later.";
+                    color: Theme.text-2;
+                    font-size: Theme.caption;
+                    wrap: word-wrap;
+                }
+            }
+            if AppState.sheet == Sheet.profile-edit: Chip {
+                text: AppState.form-portal ? "Portal profile · open network" : "Password profile";
+                has-icon: true;
+                icon: @image-url("icons/lock.svg");
+            }
+            if AppState.form-portal: VerticalLayout {
+                spacing: 6px;
+                Text {
+                    text: "Default country";
+                    color: Theme.text;
+                    font-size: Theme.small;
+                    font-weight: 600;
+                }
+                ComboBox {
+                    model: AppState.country-labels;
+                    current-index <=> AppState.form-country;
+                }
+                Text {
+                    text: "Its calling code is preselected in the sign-in form. People can still pick another.";
+                    color: Theme.text-2;
+                    font-size: Theme.caption;
+                    wrap: word-wrap;
+                }
+            }
+            if AppState.form-portal: FormField {
+                label: "Default devices per coupon";
+                error: AppState.form-portal-error;
+                text <=> AppState.form-devices;
+                edited => { AppState.form-changed(); }
+            }
+            if AppState.form-portal: CheckBox {
+                text: "New coupons count only connected time";
+                checked <=> AppState.form-connected;
+            }
+            if AppState.form-portal: FormField {
+                label: "Coupon durations offered";
+                hint: "Separated by commas, e.g. 30 min, 2 h, 3 days, 1 week. \"Custom…\" is always offered too.";
+                text <=> AppState.form-durations;
+                edited => { AppState.form-changed(); }
+            }
+            if !AppState.form-portal: FormField {
                 label: "Password";
                 hint: "8 to 63 characters";
                 counter: "\{AppState.form-password.character-count} / 63";
@@ -896,6 +1448,8 @@ component BlockedSheet inherits VerticalLayout {
         subtitle: "Profile: \{AppState.current.name}";
     }
     ScrollView {
+        // no sideways scrolling: content wraps or shrinks to the window
+        content-width: self.visible-width;
         VerticalLayout {
             padding: 16px;
             spacing: 12px;
@@ -1156,6 +1710,9 @@ export component MainWindow inherits Window {
     if AppState.sheet == Sheet.none: MainView { }
     if AppState.sheet == Sheet.profile-new || AppState.sheet == Sheet.profile-edit: ProfileSheet { }
     if AppState.sheet == Sheet.blocked: BlockedSheet { }
+    if AppState.sheet == Sheet.coupons: CouponsSheet { }
+    if AppState.sheet == Sheet.users: UsersSheet { }
+    if AppState.sheet == Sheet.settings: SettingsSheet { }
     if AppState.dialog == Dialog.restart || AppState.dialog == Dialog.delete || AppState.dialog == Dialog.close || AppState.dialog == Dialog.block-all: ConfirmDialog {
         width: parent.width;
         height: parent.height;

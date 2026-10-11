@@ -17,6 +17,9 @@ pub fn wifi_payload(ssid: &str, password: &str, hidden: bool) -> String {
         })
     };
     let hidden = if hidden { "H:true;" } else { "" };
+    if password.is_empty() {
+        return format!("WIFI:T:nopass;S:{};{hidden};", escape(ssid));
+    }
     format!("WIFI:T:WPA;S:{};P:{};{hidden};", escape(ssid), escape(password))
 }
 
@@ -51,6 +54,7 @@ mod tests {
     fn payload_escapes_special_characters() {
         assert_eq!(wifi_payload("TestHS", "motdepasse123", false), "WIFI:T:WPA;S:TestHS;P:motdepasse123;;");
         assert_eq!(wifi_payload("TestHS", "motdepasse123", true), "WIFI:T:WPA;S:TestHS;P:motdepasse123;H:true;;");
+        assert_eq!(wifi_payload("Cafe", "", false), "WIFI:T:nopass;S:Cafe;;");
         assert_eq!(wifi_payload(r#"a;b,c:d"e\f"#, "p;w", false), r#"WIFI:T:WPA;S:a\;b\,c\:d\"e\\f;P:p\;w;;"#);
     }
 }

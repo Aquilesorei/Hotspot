@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::mpsc::Sender;
 use std::path::Path;
 use std::process::Child;
 
 use crate::error::Result;
+use crate::portal_http::{PageInfo, PortalRequest, PortalServer};
 use crate::models::{DnsmasqArgs, PhyCaps, UplinkInfo, WifiAdapter};
 
 pub trait NetworkBackend {
@@ -37,6 +40,15 @@ pub trait NetworkBackend {
     /// Drops forwarded traffic from one client. `mac` must be normalized.
     fn nft_cut_mac(&self, mac: &str, cut: bool) -> Result<()>;
     fn nft_nat_present(&self) -> bool;
+    /// Captive portal on `ap`: devices not in the allowed set only reach DHCP, DNS and the portal
+    /// (their HTTP goes to `gateway:port`). Goes in our NAT table, so it disappears with it.
+    fn nft_install_portal(&self, ap: &str, gateway: &str, port: u16) -> Result<()>;
+    /// `mac` must be normalized.
+    fn nft_portal_allow(&self, mac: &str, allow: bool) -> Result<()>;
+    /// MAC of a neighbour IP on `ap`, from the kernel's ARP table.
+    fn mac_of(&self, ap: &str, ip: &str) -> Option<String>;
+    /// Starts the portal's web server; `None` where there is no network (tests).
+    fn serve_portal(&self, addr: SocketAddr, page: PageInfo, requests: Sender<PortalRequest>) -> Result<Option<PortalServer>>;
     /// Bytes forwarded to and from each client IP since the table was created: ip -> (down, up).
     fn nft_usage(&self) -> Result<HashMap<String, (u64, u64)>>;
     /// Replaces every speed limit on `ap` with `limits` (client IP, Mbit/s), down and up.

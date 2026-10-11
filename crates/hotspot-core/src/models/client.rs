@@ -3,6 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{HotspotError, Result};
+use crate::portal_store::{CouponView, PortalAction, SessionView};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Client {
@@ -61,6 +62,9 @@ pub enum Event {
     InternetCutAll { cut: bool },
     Usage { usage: Vec<DeviceUsage> },
     AccessExpired { mac: String },
+    PortalSignIn { mac: String, name: String, coupon: String, remaining_secs: u64 },
+    PortalSessionEnded { mac: String },
+    PortalData { profile: String, coupons: Vec<CouponView>, sessions: Vec<SessionView> },
     /// The profile's blocked list changed: the caller saves it to the profile file.
     BlockedChanged { blocked: Vec<BlockedDevice> },
     Error { message: String },
@@ -97,6 +101,13 @@ impl fmt::Display for Event {
                     usage.iter().map(|u| format!("{} ↓{} ↑{}", u.mac, u.down_bytes, u.up_bytes)).collect();
                 write!(f, "usage: {}", list.join(", "))
             }
+            Event::PortalSignIn { mac, name, coupon, remaining_secs } => {
+                write!(f, "{name} ({mac}) signed in with coupon {coupon}, {} min left", remaining_secs / 60)
+            }
+            Event::PortalSessionEnded { mac } => write!(f, "{mac}: portal session ended"),
+            Event::PortalData { profile, coupons, sessions } => {
+                write!(f, "portal {profile}: {} coupons, {} sessions", coupons.len(), sessions.len())
+            }
             Event::AccessExpired { mac } => write!(f, "{mac}: temporary access expired, device blocked"),
             Event::InternetCutAll { cut: true } => write!(f, "internet cut for every client"),
             Event::InternetCutAll { cut: false } => write!(f, "internet restored for every client"),
@@ -129,6 +140,8 @@ pub enum Command {
     AllowFor { mac: String, minutes: Option<u32> },
     /// `mbps: None` removes the limit.
     LimitSpeed { mac: String, mbps: Option<u32> },
+    /// Coupons and sessions of a portal profile; works whether or not it is running.
+    Portal { profile: String, #[serde(flatten)] action: PortalAction },
 }
 
 /// Lowercase `aa:bb:cc:dd:ee:ff`. Rejects anything else: the value ends up in an nft command.
@@ -182,5 +195,16 @@ mod tests {
         assert_eq!(c, Command::CutInternet { mac: Some("34:c9:3d:79:c4:67".into()) });
         let c: Command = serde_json::from_str(r#"{"cmd":"restore_internet","mac":null}"#).unwrap();
         assert_eq!(c, Command::RestoreInternet { mac: None });
+        let c: Command = serde_json::from_str(
+            r#"{"cmd":"portal","profile":"cafe","action":"create_coupons","count":5,"duration_min":60,"time_mode":"connected","max_devices":2}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            c,
+            Command::Portal {
+                profile: "cafe".into(),
+                action: PortalAction::CreateCoupons { count: 5, duration_min: 60, time_mode: crate::models::TimeMode::Connected, max_devices: 2 },
+            }
+        );
     }
 }

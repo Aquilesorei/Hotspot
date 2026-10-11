@@ -5,6 +5,8 @@ pub mod hotspot;
 pub mod models;
 mod forward;
 mod parse;
+pub mod portal_http;
+pub mod portal_store;
 mod runner;
 mod system;
 

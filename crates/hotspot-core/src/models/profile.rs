@@ -9,9 +9,10 @@ use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
 use crate::constants::{
-    BAND_5GHZ_MIN_MHZ, DEFAULT_DNS, DEFAULT_SUBNET, GENERATED_PASSPHRASE_LEN, MAX_CLIENTS, PASSPHRASE_ALPHABET, PASSPHRASE_LEN, PROFILES_FILE, SSID_LEN,
+    BAND_5GHZ_MIN_MHZ, DEFAULT_DNS, DEFAULT_SUBNET, GENERATED_PASSPHRASE_LEN, MAX_CLIENTS, PASSPHRASE_ALPHABET,
+    PASSPHRASE_LEN, PORTAL_DEVICES_PER_COUPON, PORTAL_MAX_DURATION_MIN, PROFILES_FILE, SSID_LEN,
 };
-use super::{normalize_mac, BlockedDevice};
+use super::{normalize_mac, validate_country_code, BlockedDevice, PortalSettings, ProfileKind};
 use crate::error::{HotspotError as E, Result};
 
 
@@ -26,6 +27,10 @@ pub struct FieldErrors {
 pub struct HotspotProfile {
     pub name: String,
     pub ssid: String,
+    #[serde(default)]
+    pub kind: ProfileKind,
+    /// Empty for portal profiles (open network).
+    #[serde(default)]
     pub passphrase: String,
     #[serde(default = "default_subnet")]
     pub subnet: Ipv4Net,
@@ -41,6 +46,9 @@ pub struct HotspotProfile {
     pub hidden: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_clients: Option<u32>,
+    /// Present exactly for portal profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portal: Option<PortalSettings>,
 }
 
 fn default_subnet() -> Ipv4Net { DEFAULT_SUBNET.parse().unwrap() }
@@ -57,10 +65,17 @@ impl HotspotProfile {
             aliases: BTreeMap::new(),
             hidden: false,
             max_clients: None,
+            kind: ProfileKind::Standard,
+            portal: None,
         }
     }
 
 
+
+    /// An open network whose devices need a coupon from the captive portal.
+    pub fn new_portal(name: &str, ssid: &str) -> Self {
+        Self { kind: ProfileKind::Portal, portal: Some(PortalSettings::default()), ..Self::new(name, ssid, "") }
+    }
 
     pub fn validate(&self) -> Result<()> {
         self.validate_ssid()?;
@@ -81,6 +96,27 @@ impl HotspotProfile {
         }
         if self.upstream_dns.is_empty() {
             return Err(E::invalid_profile("at least one upstream DNS server is required"));
+        }
+        self.validate_portal()
+    }
+
+    fn validate_portal(&self) -> Result<()> {
+        let settings = match (self.kind, &self.portal) {
+            (ProfileKind::Standard, None) => return Ok(()),
+            (ProfileKind::Standard, Some(_)) => return Err(E::invalid_profile("only portal profiles have portal settings")),
+            (ProfileKind::Portal, None) => return Err(E::invalid_profile("portal profiles need portal settings")),
+            (ProfileKind::Portal, Some(s)) => s,
+        };
+        validate_country_code(&settings.country_code)?;
+        if settings.durations_min.is_empty() || settings.durations_min.iter().any(|&m| m == 0 || m > PORTAL_MAX_DURATION_MIN) {
+            return Err(E::invalid_profile(format!("coupon durations must be 1 to {PORTAL_MAX_DURATION_MIN} minutes")));
+        }
+        if !PORTAL_DEVICES_PER_COUPON.contains(&settings.devices_per_coupon) {
+            return Err(E::invalid_profile(format!(
+                "devices per coupon must be {} to {}",
+                PORTAL_DEVICES_PER_COUPON.start(),
+                PORTAL_DEVICES_PER_COUPON.end()
+            )));
         }
         Ok(())
     }
@@ -122,6 +158,12 @@ impl HotspotProfile {
     }
 
     fn validate_passphrase(&self) -> Result<()> {
+        if self.kind == ProfileKind::Portal {
+            return match self.passphrase.is_empty() {
+                true => Ok(()),
+                false => Err(E::invalid_profile("portal profiles are open networks: no password")),
+            };
+        }
         let len_ok = PASSPHRASE_LEN.contains(&self.passphrase.len());
         let printable_ascii = self.passphrase.bytes().all(|b| (0x20..=0x7e).contains(&b));
 
@@ -144,12 +186,13 @@ impl HotspotProfile {
     pub fn hostapd_conf(&self, ap: &str, channel: u32, freq_mhz: u32, ctrl_dir: &Path) -> String {
         let hw_mode = if freq_mhz < BAND_5GHZ_MIN_MHZ { "g" } else { "a" };
         let mut conf = format!(
-            "interface={ap}\ndriver=nl80211\nssid={}\nhw_mode={hw_mode}\nchannel={channel}\nieee80211n=1\n\
-             wpa=2\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\nwpa_passphrase={}\nctrl_interface={}\n",
+            "interface={ap}\ndriver=nl80211\nssid={}\nhw_mode={hw_mode}\nchannel={channel}\nieee80211n=1\nctrl_interface={}\n",
             self.ssid,
-            self.passphrase,
             ctrl_dir.display()
         );
+        if self.kind == ProfileKind::Standard {
+            conf.push_str(&format!("wpa=2\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\nwpa_passphrase={}\n", self.passphrase));
+        }
         if self.hidden {
             conf.push_str("ignore_broadcast_ssid=1\n");
         }
@@ -220,6 +263,15 @@ impl ProfileStore {
         let mut s = Self::load(&path)?;
         if Some(p.name.as_str()) != old_name && s.profiles.iter().any(|q| q.name == p.name) {
             return Err(E::ProfileExists(p.name));
+        }
+        if let Some(old) = s.profiles.iter().find(|q| Some(q.name.as_str()) == old_name) {
+            if old.kind != p.kind {
+                return Err(E::ProfileKindChange(old.name.clone()));
+            }
+            // the service keeps a portal's coupons under its name
+            if old.kind == ProfileKind::Portal && old.name != p.name {
+                return Err(E::invalid_profile("portal profiles can't be renamed: their coupons are kept under this name"));
+            }
         }
         match s.profiles.iter().position(|q| Some(q.name.as_str()) == old_name) {
             Some(i) => s.profiles[i] = p,
@@ -341,6 +393,39 @@ mod tests {
         assert!(conf.contains("ignore_broadcast_ssid=1\n") && conf.contains("max_num_sta=5\n"));
         prof.max_clients = Some(0);
         assert!(prof.validate().is_err());
+    }
+
+    #[test]
+    fn portal_profiles() {
+        let portal = HotspotProfile::new_portal("cafe", "Cafe WiFi");
+        assert!(portal.validate().is_ok());
+        let conf = portal.hostapd_conf("ap0", 1, 2412, Path::new("/run/x/hostapd"));
+        assert!(!conf.contains("wpa") && conf.contains("ssid=Cafe WiFi\n"));
+        assert!(p("T", "motdepasse").hostapd_conf("ap0", 1, 2412, Path::new("/x")).contains("wpa=2\n"));
+
+        assert!(HotspotProfile { passphrase: "motdepasse".into(), ..portal.clone() }.validate().is_err());
+        assert!(HotspotProfile { portal: None, ..portal.clone() }.validate().is_err());
+        assert!(HotspotProfile { portal: portal.portal.clone(), ..p("T", "motdepasse") }.validate().is_err());
+        let mut bad = portal.clone();
+        bad.portal.as_mut().unwrap().devices_per_coupon = 0;
+        assert!(bad.validate().is_err());
+
+        // old profile files have no kind: they are standard
+        let old: HotspotProfile = toml::from_str("name='m'\nssid='TestHS'\npassphrase='motdepasse123'").unwrap();
+        assert_eq!(old.kind, ProfileKind::Standard);
+    }
+
+    #[test]
+    fn profile_kind_cannot_change() {
+        let f = std::env::temp_dir().join(format!("hs-kind-{}.toml", std::process::id()));
+        let path = Some(f.as_path());
+        ProfileStore::store("home", "TestHS", "motdepasse123", path).unwrap();
+        let as_portal = HotspotProfile::new_portal("home", "TestHS");
+        assert!(matches!(ProfileStore::upsert(Some("home"), as_portal, path), Err(E::ProfileKindChange(_))));
+        ProfileStore::upsert(None, HotspotProfile::new_portal("cafe", "Cafe"), path).unwrap();
+        assert_eq!(ProfileStore::get("cafe", path).unwrap().kind, ProfileKind::Portal);
+        assert!(ProfileStore::upsert(Some("cafe"), HotspotProfile::new_portal("cafe2", "Cafe"), path).is_err());
+        fs::remove_file(&f).unwrap();
     }
 
     #[test]

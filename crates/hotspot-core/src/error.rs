@@ -17,6 +17,21 @@ pub enum HotspotError {
     #[error("a profile named {0} already exists")]
     ProfileExists(String),
 
+    #[error("profile {0} can't change between standard and portal: create a new profile")]
+    ProfileKindChange(String),
+
+    #[error("this coupon code isn't valid")]
+    CouponInvalid,
+
+    #[error("this coupon has no time left")]
+    CouponUsedUp,
+
+    #[error("this coupon is already used on {0} device(s)")]
+    CouponFull(u32),
+
+    #[error("this device was signed out of this coupon by the hotspot")]
+    CouponKicked,
+
     #[error("no Wi-Fi interface found")]
     NoWifiInterface,
 

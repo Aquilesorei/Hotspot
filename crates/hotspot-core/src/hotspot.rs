@@ -1,7 +1,8 @@
 //! state.json doubles as an undo stack: each resource is recorded before it is created,
 //! and `teardown` undoes whatever is recorded.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -18,13 +19,15 @@ use crate::network_backend::NetworkBackend;
 use crate::constants::{
     bin, AP_ENABLED, AP_IFACE as AP, AP_STA_CONNECTED, AP_STA_DISCONNECTED, AP_STA_PSK_MISMATCH, DHCPACK,
     DNSMASQ_LEASES, DNSMASQ_STARTUP, DOCKER_USER, FIREWALLD_ZONE as ZONE, GUEST_MINUTES, HOSTAPD_CONF, HOSTAPD_CTRL, SPEED_LIMIT_MBPS,
-    HOSTAPD_TIMEOUT, LOG_LINES, MAX_RESTARTS, USAGE_REPORT_EVERY, NAT_TABLE, RESTART_WINDOW, RUNTIME_DIR, STATE_FILE, TICK,
+    HOSTAPD_TIMEOUT, LOG_LINES, MAX_RESTARTS, PORTAL_LOCKOUT, PORTAL_MAX_FAILURES, PORTAL_PORT, PORTAL_SAVE_EVERY, USAGE_REPORT_EVERY, NAT_TABLE, RESTART_WINDOW, RUNTIME_DIR, STATE_FILE, TICK,
 };
+use crate::portal_http::{PageInfo, PortalRequest, PortalServer};
+use crate::portal_store::{self, PortalAction, PortalStore, SignIn};
 use crate::system::SystemBackend;
 use crate::error::{HotspotError, Result};
 use crate::forward::{docker_install, docker_installed, docker_present, docker_remove};
 use crate::models::{
-    normalize_mac, BlockedDevice, ChannelClass, Client, Command, DeviceUsage, DnsmasqArgs, Event, Forwarding, HotspotProfile,
+    normalize_mac, ProfileKind, BlockedDevice, ChannelClass, Client, Command, DeviceUsage, DnsmasqArgs, Event, Forwarding, HotspotProfile,
     HotspotState, Probe, Status, UplinkInfo,
 };
 
@@ -40,6 +43,26 @@ struct Live {
 }
 
 type Shared = Arc<Mutex<Live>>;
+
+/// A running portal profile: its coupons, the web server, and who is let through.
+struct PortalRuntime {
+    profile: String,
+    path: PathBuf,
+    store: PortalStore,
+    _server: Option<PortalServer>,
+    /// Where the redirect points: the server may have fallen back to a free port.
+    port: u16,
+    requests: Receiver<PortalRequest>,
+    /// MACs currently in the nft allowed set.
+    allowed: HashSet<String>,
+    /// Wrong codes per MAC: (count, since).
+    failures: HashMap<String, (u32, Instant)>,
+    /// Connected time is measured with the monotonic clock: a wall-clock jump (NTP after a
+    /// boot with a wrong RTC) must not charge or refund hours.
+    last_tick: Instant,
+    carry: Duration,
+    last_save: Instant,
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct RunState {
@@ -87,6 +110,9 @@ pub struct Hotspot<B: NetworkBackend> {
     /// Last client list reported, to send `Event::Clients` only on change.
     reported_clients: Vec<Client>,
     reported_usage: (Instant, HashMap<String, (u64, u64)>),
+    portal: Option<PortalRuntime>,
+    /// Where portal coupons and sessions are kept (root-owned).
+    portal_dir: PathBuf,
     restarts: Vec<Instant>,
 }
 
@@ -113,6 +139,8 @@ impl<B: NetworkBackend> Hotspot<B> {
             usage: HashMap::new(),
             reported_clients: Vec::new(),
             reported_usage: (Instant::now(), HashMap::new()),
+            portal: None,
+            portal_dir: portal_store::default_dir(),
             restarts: Vec::new(),
         }
     }
@@ -221,6 +249,9 @@ impl<B: NetworkBackend> Hotspot<B> {
         self.save()?;
         self.backend.nft_install_nat(&iface)?;
         self.reapply_cuts()?;
+        if p.kind == ProfileKind::Portal {
+            self.start_portal(p)?;
+        }
 
         if docker_present(&self.backend) {
             self.st().created.docker_rules = true;
@@ -410,11 +441,195 @@ impl<B: NetworkBackend> Hotspot<B> {
         Ok(())
     }
 
+    fn start_portal(&mut self, p: &HotspotProfile) -> Result<()> {
+        let settings = p.portal.clone().unwrap_or_default();
+        let path = portal_store::store_path(&self.portal_dir, &p.name);
+        let store = PortalStore::load(&path)?;
+        let gateway = p.gateway();
+        let (tx, rx) = mpsc::channel();
+        let page = PageInfo { ssid: p.ssid.clone(), country_code: settings.country_code };
+        let server = self.backend.serve_portal(SocketAddr::from((gateway, PORTAL_PORT)), page, tx)?;
+        let port = server.as_ref().map_or(PORTAL_PORT, PortalServer::port);
+        self.backend.nft_install_portal(AP, &gateway.to_string(), port)?;
+        self.portal = Some(PortalRuntime {
+            profile: p.name.clone(),
+            path,
+            store,
+            _server: server,
+            port,
+            requests: rx,
+            allowed: HashSet::new(),
+            failures: HashMap::new(),
+            last_tick: Instant::now(),
+            carry: Duration::ZERO,
+            last_save: Instant::now(),
+        });
+        self.sync_portal()
+    }
+
+    /// Makes the nft allowed set match the sessions that still have time.
+    fn sync_portal(&mut self) -> Result<()> {
+        let Some(rt) = self.portal.as_mut() else { return Ok(()) };
+        let wanted = rt.store.allowed_macs(portal_store::now());
+        for mac in wanted.difference(&rt.allowed) {
+            self.backend.nft_portal_allow(mac, true)?;
+        }
+        for mac in rt.allowed.difference(&wanted) {
+            self.backend.nft_portal_allow(mac, false)?;
+        }
+        rt.allowed = wanted;
+        Ok(())
+    }
+
+    /// After our nft table was recreated: the portal rules and allowed set went with it.
+    fn reinstall_portal(&mut self) -> Result<()> {
+        let Some(rt) = self.portal.as_mut() else { return Ok(()) };
+        rt.allowed.clear();
+        let gateway = self.profile.as_ref().map(HotspotProfile::gateway).expect("profile is known while running");
+        self.backend.nft_install_portal(AP, &gateway.to_string(), rt.port)?;
+        self.sync_portal()
+    }
+
+    /// Answers the forms submitted since the last call.
+    fn serve_portal(&mut self, events: &mut Vec<Event>) {
+        let Some(rt) = self.portal.as_ref() else { return };
+        let requests: Vec<PortalRequest> = rt.requests.try_iter().collect();
+        for req in requests {
+            let from_lease =
+                self.live.lock().unwrap().leases.iter().find(|(_, (ip, _))| *ip == req.ip).map(|(mac, _)| mac.clone());
+            let result = match from_lease.or_else(|| self.backend.mac_of(AP, &req.ip)) {
+                Some(mac) => {
+                    let signed_in = match &req.form {
+                        Some(form) => self.portal_sign_in(&mac, &req.ip, form, events).map(drop),
+                        None => Ok(()),
+                    };
+                    signed_in.and_then(|()| {
+                        let rt = self.portal.as_ref().ok_or("The portal is not running.")?;
+                        rt.store.access_for(&mac, portal_store::now()).ok_or_else(|| "not signed in".to_string())
+                    })
+                }
+                None => Err("We couldn't identify your device. Turn Wi-Fi off and on, then try again.".into()),
+            };
+            let _ = req.reply.send(result);
+        }
+    }
+
+    /// Checks one sign-in; wrong codes count towards a lockout for that device.
+    fn portal_sign_in(&mut self, mac: &str, ip: &str, form: &SignIn, events: &mut Vec<Event>) -> std::result::Result<u64, String> {
+        let rt = self.portal.as_mut().ok_or("The portal is not running.")?;
+        if let Some((count, since)) = rt.failures.get(mac) {
+            if since.elapsed() >= PORTAL_LOCKOUT {
+                rt.failures.remove(mac);
+            } else if *count >= PORTAL_MAX_FAILURES {
+                let wait = (PORTAL_LOCKOUT - since.elapsed()).as_secs() / 60 + 1;
+                return Err(format!("Too many wrong codes. Try again in {wait} min."));
+            }
+        }
+        match rt.store.redeem(form, mac, portal_store::now()) {
+            Ok(secs) => {
+                rt.failures.remove(mac);
+                rt.store.note_ip(mac, ip);
+                if let Err(e) = rt.store.save(&rt.path) {
+                    eprintln!("warning: could not save portal data: {e}");
+                }
+                rt.last_save = Instant::now();
+                events.push(Event::PortalSignIn {
+                    mac: mac.into(),
+                    name: format!("{} {}", form.first_name.trim(), form.last_name.trim()),
+                    coupon: form.code.trim().to_uppercase(),
+                    remaining_secs: secs,
+                });
+                self.sync_portal().map_err(|e| e.to_string())?;
+                Ok(secs)
+            }
+            Err(e @ (HotspotError::CouponInvalid | HotspotError::CouponUsedUp | HotspotError::CouponFull(_))) => {
+                rt.failures.entry(mac.into()).or_insert((0, Instant::now())).0 += 1;
+                Err(e.to_string())
+            }
+            Err(HotspotError::InvalidProfile(message)) => Err(capitalize(&message)),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn portal_tick(&mut self, events: &mut Vec<Event>) {
+        let (connected, leases): (HashSet<String>, Vec<(String, String)>) = {
+            let live = self.live.lock().unwrap();
+            let connected = live.clients.iter().map(|(mac, _)| mac.clone()).collect();
+            (connected, live.leases.iter().map(|(mac, (ip, _))| (mac.clone(), ip.clone())).collect())
+        };
+        let Some(rt) = self.portal.as_mut() else { return };
+        for (mac, ip) in &leases {
+            rt.store.note_ip(mac, ip);
+        }
+        let now = portal_store::now();
+        rt.carry += rt.last_tick.elapsed();
+        rt.last_tick = Instant::now();
+        let elapsed = rt.carry.as_secs();
+        rt.carry -= Duration::from_secs(elapsed);
+        let ended = rt.store.tick(now, elapsed, &connected);
+        if !ended.is_empty() || rt.last_save.elapsed() >= PORTAL_SAVE_EVERY {
+            if let Err(e) = rt.store.save(&rt.path) {
+                eprintln!("warning: could not save portal data: {e}");
+            }
+            rt.last_save = Instant::now();
+        }
+        events.extend(ended.into_iter().map(|mac| Event::PortalSessionEnded { mac }));
+        warn(self.sync_portal());
+    }
+
+    /// Applies the 30-day purge to every portal profile's file, not only the running one.
+    /// The service calls it now and then.
+    pub fn purge_portal_files(&self) {
+        let Ok(entries) = fs::read_dir(&self.portal_dir) else { return };
+        let running = self.portal.as_ref().map(|rt| rt.path.clone());
+        for path in entries.flatten().map(|e| e.path()) {
+            if path.extension().is_none_or(|x| x != "json") || Some(&path) == running.as_ref() {
+                continue;
+            }
+            let purged = PortalStore::load(&path).and_then(|mut store| {
+                store.tick(portal_store::now(), 0, &HashSet::new());
+                store.save(&path)
+            });
+            if let Err(e) = purged {
+                eprintln!("warning: could not purge {}: {e}", path.display());
+            }
+        }
+    }
+
+    /// Admin actions; on the running profile they apply live, otherwise straight to its file.
+    fn portal_command(&mut self, profile: &str, action: PortalAction) -> Result<Event> {
+        let now = portal_store::now();
+        let changes = action != PortalAction::List;
+        let (coupons, sessions) = match self.portal.as_mut().filter(|rt| rt.profile == profile) {
+            Some(rt) => {
+                rt.store.apply(action, now)?;
+                if changes {
+                    rt.store.save(&rt.path)?;
+                }
+                let views = rt.store.views(now);
+                self.sync_portal()?;
+                views
+            }
+            None => {
+                let path = portal_store::store_path(&self.portal_dir, profile);
+                let mut store = PortalStore::load(&path)?;
+                let expired = !store.tick(now, 0, &HashSet::new()).is_empty();
+                store.apply(action, now)?;
+                if changes || expired {
+                    store.save(&path)?;
+                }
+                store.views(now)
+            }
+        };
+        Ok(Event::PortalData { profile: profile.into(), coupons, sessions })
+    }
+
     /// One command from a caller (CLI, service). Per-client changes show up in the next
     /// `Event::Clients`; the others get their own event.
     pub fn handle(&mut self, cmd: Command) -> Result<Option<Event>> {
         let (mac, cut) = match cmd {
             Command::Stop => return Ok(None),
+            Command::Portal { profile, action } => return self.portal_command(&profile, action).map(Some),
             Command::AllowFor { mac, minutes } => return self.set_time_limit(&mac, minutes).map(|_| None),
             Command::LimitSpeed { mac, mbps } => return self.set_speed_limit(&mac, mbps).map(|_| None),
             Command::Block { mac } => return Ok(Some(Event::BlockedChanged { blocked: self.set_blocked(&mac, true)? })),
@@ -528,6 +743,7 @@ impl<B: NetworkBackend> Hotspot<B> {
         }
         if nat_gone {
             warn(self.reapply_cuts());
+            warn(self.reinstall_portal());
         }
         match self.backend.nft_usage() {
             Ok(usage) => {
@@ -537,6 +753,9 @@ impl<B: NetworkBackend> Hotspot<B> {
             Err(e) => eprintln!("warning: could not read data usage: {e}"),
         }
         warn(self.apply_speed());
+        let mut portal_events = Vec::new();
+        self.portal_tick(&mut portal_events);
+        self.live.lock().unwrap().events.extend(portal_events);
         let expired: Vec<String> =
             self.deadlines.iter().filter(|(_, d)| **d <= Instant::now()).map(|(mac, _)| mac.clone()).collect();
         for mac in expired {
@@ -584,6 +803,7 @@ impl<B: NetworkBackend> Hotspot<B> {
     /// Events from hostapd/dnsmasq output, plus `Event::Clients` when the list changed.
     pub fn take_events(&mut self) -> Vec<Event> {
         let mut events = std::mem::take(&mut self.live.lock().unwrap().events);
+        self.serve_portal(&mut events);
         // connected time and countdowns change every second: compare without them
         let clients = self.status().clients;
         let comparable: Vec<Client> = clients
@@ -632,6 +852,10 @@ impl<B: NetworkBackend> Hotspot<B> {
 
     fn teardown(&mut self) {
         let Some(st) = self.run.take() else { return };
+        if let Some(mut rt) = self.portal.take() {
+            rt.store.tick(portal_store::now(), 0, &HashSet::new()); // everyone leaves with the network
+            warn(rt.store.save(&rt.path)); // its web server stops when `rt` is dropped
+        }
         let b = &self.backend;
         for (child, pid, name) in [(self.dnsmasq.take(), st.dnsmasq_pid, bin::DNSMASQ), (self.hostapd.take(), st.hostapd_pid, bin::HOSTAPD)] {
             if let Some(pid) = pid {
@@ -714,6 +938,11 @@ impl<B: NetworkBackend> Drop for Hotspot<B> {
     }
 }
 
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
 fn warn(r: Result<()>) {
     if let Err(e) = r {
         eprintln!("warning (cleanup): {e}");
@@ -794,6 +1023,8 @@ fn on_hostapd_line(live: &mut Live, line: &str) {
 fn on_dnsmasq_line(live: &mut Live, line: &str) {
     let mut words = line.split_whitespace().skip_while(|w| !w.starts_with(DHCPACK)).skip(1);
     if let (Some(ip), Some(mac)) = (words.next(), words.next()) {
+        // an IP given to a new device no longer belongs to the one that had it
+        live.leases.retain(|other, (old_ip, _)| other == mac || old_ip != ip);
         live.leases.insert(mac.into(), (ip.into(), words.next().map(String::from)));
     }
 }
@@ -805,7 +1036,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
-    use crate::models::{ChannelInfo, DnsmasqArgs, PhyCaps, WifiAdapter};
+    use crate::models::{ChannelInfo, DnsmasqArgs, PhyCaps, TimeMode, WifiAdapter};
 
     #[derive(Debug, Default, PartialEq)]
     struct World {
@@ -819,6 +1050,8 @@ mod tests {
         denied: Vec<String>,
         usage: HashMap<String, (u64, u64)>,
         tc: Vec<(String, u32)>,
+        portal: bool,
+        portal_allowed: Vec<String>,
     }
 
     struct Mock {
@@ -928,15 +1161,17 @@ mod tests {
         fn nft_install_nat(&self, _: &str) -> Result<()> {
             self.hit("nft_install_nat")?;
             let mut w = self.w.borrow_mut();
-            (w.nft, w.cut_all) = (true, false);
+            (w.nft, w.cut_all, w.portal) = (true, false, false);
             w.cut_macs.clear();
+            w.portal_allowed.clear();
             Ok(())
         }
         fn nft_remove_nat(&self) -> Result<()> {
             self.calls.borrow_mut().push("nft_remove_nat".into());
             let mut w = self.w.borrow_mut();
-            (w.nft, w.cut_all) = (false, false);
+            (w.nft, w.cut_all, w.portal) = (false, false, false);
             w.cut_macs.clear();
+            w.portal_allowed.clear();
             Ok(())
         }
         fn nft_cut_iface(&self, _: &str, cut: bool) -> Result<()> {
@@ -955,6 +1190,25 @@ mod tests {
         }
         fn nft_nat_present(&self) -> bool {
             self.w.borrow().nft
+        }
+        fn nft_install_portal(&self, _: &str, _: &str, _: u16) -> Result<()> {
+            self.hit("nft_install_portal")?;
+            self.w.borrow_mut().portal = true;
+            Ok(())
+        }
+        fn nft_portal_allow(&self, mac: &str, allow: bool) -> Result<()> {
+            let allowed = &mut self.w.borrow_mut().portal_allowed;
+            allowed.retain(|m| m != mac);
+            if allow {
+                allowed.push(mac.into());
+            }
+            Ok(())
+        }
+        fn mac_of(&self, _: &str, _: &str) -> Option<String> {
+            None
+        }
+        fn serve_portal(&self, _: SocketAddr, _: PageInfo, _: mpsc::Sender<PortalRequest>) -> Result<Option<PortalServer>> {
+            Ok(None)
         }
         fn nft_usage(&self) -> Result<HashMap<String, (u64, u64)>> {
             Ok(self.w.borrow().usage.clone())
@@ -1231,6 +1485,11 @@ mod tests {
         on_dnsmasq_line(&mut live, "dnsmasq-dhcp: 292180383 DHCPREQUEST(ap0) 192.168.12.100 34:c9:3d:79:c4:67");
         on_dnsmasq_line(&mut live, "dnsmasq-dhcp: 292180383 DHCPACK(ap0) 192.168.12.100 34:c9:3d:79:c4:67 pop-os");
         on_dnsmasq_line(&mut live, "dnsmasq-dhcp: 292180384 DHCPACK(ap0) 192.168.12.101 aa:bb:cc:dd:ee:ff");
+        // .100 goes to a new device: the old owner loses it
+        on_dnsmasq_line(&mut live, "dnsmasq-dhcp: 292180385 DHCPACK(ap0) 192.168.12.100 de:ad:be:ef:00:01");
+        assert!(!live.leases.contains_key("34:c9:3d:79:c4:67"));
+        live.leases.remove("de:ad:be:ef:00:01");
+        on_dnsmasq_line(&mut live, "dnsmasq-dhcp: 292180383 DHCPACK(ap0) 192.168.12.100 34:c9:3d:79:c4:67 pop-os");
         assert_eq!(live.leases["34:c9:3d:79:c4:67"], ("192.168.12.100".into(), Some("pop-os".into())));
         assert_eq!(live.leases["aa:bb:cc:dd:ee:ff"], ("192.168.12.101".into(), None));
         assert_eq!(live.leases.len(), 2);
@@ -1331,6 +1590,65 @@ mod tests {
         assert!(h.backend().w.borrow().tc.is_empty());
         h.tick().unwrap();
         assert_eq!(h.backend().w.borrow().tc, [("192.168.12.100".to_string(), 5)]);
+    }
+
+    fn sign_in(code: &str) -> SignIn {
+        SignIn {
+            first_name: "Asha".into(),
+            last_name: "Rao".into(),
+            country_code: "+91".into(),
+            phone: "9876543210".into(),
+            code: code.into(),
+        }
+    }
+
+    #[test]
+    fn captive_portal_end_to_end() {
+        let mut h = hotspot(Mock::new());
+        h.portal_dir = h.runtime_dir.with_extension("portal");
+        let profile = HotspotProfile::new_portal("cafe", "Cafe WiFi");
+        let create = PortalAction::CreateCoupons { count: 2, duration_min: 60, time_mode: TimeMode::Real, max_devices: 1 };
+        // coupons can be made before the hotspot runs
+        let Some(Event::PortalData { coupons, .. }) = h.handle(Command::Portal { profile: "cafe".into(), action: create }).unwrap() else {
+            panic!()
+        };
+        let code = coupons[0].code.clone();
+
+        h.start(&profile).unwrap();
+        assert!(h.backend().w.borrow().portal);
+        let mac = "12:5a:7a:56:8a:d6";
+        let mut events = vec![];
+        for _ in 0..PORTAL_MAX_FAILURES {
+            assert!(h.portal_sign_in(mac, "192.168.12.50", &sign_in("WRONG-CODE"), &mut events).is_err());
+        }
+        let locked = h.portal_sign_in(mac, "192.168.12.50", &sign_in(&code), &mut events).unwrap_err();
+        assert!(locked.contains("Too many wrong codes"), "{locked}");
+        h.portal.as_mut().unwrap().failures.clear();
+
+        assert_eq!(h.portal_sign_in(mac, "192.168.12.50", &sign_in(&code), &mut events).unwrap(), 3600);
+        assert_eq!(h.backend().w.borrow().portal_allowed, [mac]);
+        assert!(matches!(&events[0], Event::PortalSignIn { name, .. } if name == "Asha Rao"));
+
+        // our nft table vanished: the portal rules and the allowed device come back
+        h.backend().w.borrow_mut().nft = false;
+        h.tick().unwrap();
+        let w = h.backend().w.borrow();
+        assert!(w.portal && w.portal_allowed == [mac]);
+        drop(w);
+
+        // time runs out
+        h.portal.as_mut().unwrap().store.coupons.iter_mut().for_each(|c| c.expires = c.expires.map(|e| e - 3600));
+        h.tick().unwrap();
+        assert!(h.backend().w.borrow().portal_allowed.is_empty());
+        assert!(h.take_events().iter().any(|e| matches!(e, Event::PortalSessionEnded { .. })));
+
+        h.stop().unwrap();
+        assert!(clean(&h));
+        // data survived the stop
+        let list = Command::Portal { profile: "cafe".into(), action: PortalAction::List };
+        let Some(Event::PortalData { sessions, .. }) = h.handle(list).unwrap() else { panic!() };
+        assert_eq!(sessions[0].phone.as_deref(), Some("+919876543210"));
+        fs::remove_dir_all(&h.portal_dir).unwrap();
     }
 
     #[test]

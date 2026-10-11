@@ -61,6 +61,34 @@ pub(crate) const DHCPACK: &str = "DHCPACK(";
 pub(crate) const SSID_LEN: RangeInclusive<usize> = 1..=32;
 pub(crate) const PASSPHRASE_LEN: RangeInclusive<usize> = 8..=63;
 pub(crate) const MAX_CLIENTS: RangeInclusive<u32> = 1..=255;
+
+// Captive portal
+pub(crate) const PORTAL_DEFAULT_COUNTRY_CODE: &str = "+91";
+/// 10/15/30 min, 1/2/3/5 h, 1/3 days, 1 week, 1/6 months, 1 year (a month counts 30 days).
+pub(crate) const PORTAL_DEFAULT_DURATIONS_MIN: [u64; 13] =
+    [10, 15, 30, 60, 120, 180, 300, 1440, 4320, 10080, 43200, 259200, 525600];
+pub(crate) const PORTAL_MAX_DURATION_MIN: u64 = 5 * 525600;
+pub(crate) const PORTAL_DEVICES_PER_COUPON: RangeInclusive<u32> = 1..=32;
+pub(crate) const PORTAL_DIR: &str = "/var/lib/hotspot/portal";
+pub(crate) const PORTAL_PORT: u16 = 8080;
+/// Resolved by dnsmasq to the gateway on portal networks. `.internal` is reserved by ICANN for
+/// private networks: browsers open it instead of searching for it, and it never hits a real site.
+pub const PORTAL_HOSTNAME: &str = "wifi.internal";
+pub(crate) const PORTAL_MAX_FAILURES: u32 = 5;
+pub(crate) const PORTAL_LOCKOUT: Duration = Duration::from_secs(10 * 60);
+/// Connected-time accounting changes every tick: persist it at this pace (state changes save at once).
+pub(crate) const PORTAL_SAVE_EVERY: Duration = Duration::from_secs(30);
+pub(crate) const PORTAL_ALLOWED_SET: &str = "portal_allowed";
+pub(crate) const PORTAL_CHAIN: &str = "portal_redirect";
+pub(crate) const ARP_TABLE: &str = "/proc/net/arp";
+/// Names and phone numbers are erased this long after a session ends.
+pub(crate) const PORTAL_PURGE_AFTER_SECS: u64 = 30 * 24 * 3600;
+/// Connections and disconnections kept per session; older ones are dropped.
+pub(crate) const PORTAL_HISTORY_MAX: usize = 200;
+pub(crate) const COUPON_CODE_LEN: usize = 8;
+pub(crate) const NAME_MAX_CHARS: usize = 64;
+/// National number length, without the country code.
+pub(crate) const PHONE_DIGITS: RangeInclusive<usize> = 4..=14;
 pub(crate) const SPEED_LIMIT_MBPS: RangeInclusive<u32> = 1..=1000;
 pub(crate) const GUEST_MINUTES: RangeInclusive<u32> = 1..=24 * 60;
 pub(crate) const GENERATED_PASSPHRASE_LEN: usize = 16;

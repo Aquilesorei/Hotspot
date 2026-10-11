@@ -15,8 +15,12 @@ use hotspot_core::{Command, Hotspot, HotspotProfile, HotspotState, CONTROL_SOCKE
 use serde_json::{json, Value};
 
 const TICK: Duration = Duration::from_secs(2);
+/// Portal pages wait for the engine's answer: it is checked this often while running.
+const EVENTS_EVERY: Duration = Duration::from_millis(200);
 /// A client that stops reading must not freeze the engine: past this, it gets dropped.
 const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+/// Personal data of portal profiles that don't run is purged at this pace.
+const PURGE_EVERY: Duration = Duration::from_secs(3600);
 
 enum Msg {
     Connected(UnixStream),
@@ -49,9 +53,19 @@ pub fn run() -> anyhow::Result<()> {
     let mut clients: Vec<UnixStream> = Vec::new();
     let mut running_profile: Option<String> = None;
     let mut last_tick = Instant::now();
+    hotspot.purge_portal_files();
+    let mut last_purge = Instant::now();
     loop {
+        if last_purge.elapsed() >= PURGE_EVERY {
+            hotspot.purge_portal_files();
+            last_purge = Instant::now();
+        }
         let mut out: Vec<Value> = Vec::new();
-        match rx.recv_timeout(TICK.saturating_sub(last_tick.elapsed())) {
+        let mut wait = TICK.saturating_sub(last_tick.elapsed());
+        if hotspot.status().state == HotspotState::Running {
+            wait = wait.min(EVENTS_EVERY);
+        }
+        match rx.recv_timeout(wait) {
             Ok(Msg::Connected(mut stream)) => {
                 let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
                 let hello = json!({ "event": "hello", "status": hotspot.status(), "profile": running_profile });
